@@ -80,12 +80,23 @@
 // RUN:       result.failedCount != 0 || result.hasFailure)
 // RUN:     return 1;
 // RUN:
+// RUN:   StatefulToy single;
+// RUN:   single.view.inp = 11;
+// RUN:   single.view.internal.core.taps.words[0].data = 3;
+// RUN:   single.view.internal.core.taps.words[1].data = 5;
+// RUN:   single.eval();
+// RUN:   single.eval();
+// RUN:   single.eval();
+// RUN:   if (single.view.out != 44 || single.view.internal.core.acc != 44 ||
+// RUN:       single.view.internal.core.count != 3)
+// RUN:     return 2;
+// RUN:
 // RUN:   StatefulToyView first(states.data());
 // RUN:   StatefulToyView last(states.data() + stride * (stateCount - 1));
 // RUN:   return first.out != last.out && first.internal.core.count == 3 &&
 // RUN:                  last.internal.core.count == 3
 // RUN:              ? 0
-// RUN:              : 2;
+// RUN:              : 3;
 // RUN: }
 // RUN: EOF
 // RUN: %host_cxx -std=c++17 -I %CIRCT_SOURCE%/tools/arcilator -I %t.dir %t.dir/test.cpp -o %t.dir/test
