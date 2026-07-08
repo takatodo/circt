@@ -5,7 +5,7 @@
 // Layout/View/eval(void *) shape is enough to drive independent state slots.
 //
 // RUN: mkdir -p %t.dir
-// RUN: arcilator %s --state-file %t.dir/state.json -o %t.dir/sweep_toy.ll
+// RUN: arcilator %s --no-runtime --no-generate-driver --state-file %t.dir/state.json -o %t.dir/sweep_toy.ll
 // RUN: %PYTHON% %CIRCT_SOURCE%/tools/arcilator/arcilator-header-cpp.py %t.dir/state.json > %t.dir/sweep_toy.h
 // RUN: llc -O3 --filetype=obj %t.dir/sweep_toy.ll -o %t.dir/sweep_toy.o
 // RUN: cat > %t.dir/test.cpp <<'EOF'
