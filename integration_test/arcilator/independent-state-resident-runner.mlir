@@ -36,6 +36,23 @@
 // RUN:   return caseIndex % 6;
 // RUN: }
 // RUN:
+// RUN: struct RefShiftReg {
+// RUN:   std::uint8_t srA = 0xfe;
+// RUN:   std::uint8_t srB = 0x00;
+// RUN:   std::uint8_t srC = 0xca;
+// RUN:
+// RUN:   void cycle(bool en, std::uint8_t din) {
+// RUN:     const auto nextA = en ? din : srA;
+// RUN:     const auto nextB = en ? srA : srB;
+// RUN:     const auto nextC = en ? srB : srC;
+// RUN:     srA = nextA;
+// RUN:     srB = nextB;
+// RUN:     srC = nextC;
+// RUN:   }
+// RUN:
+// RUN:   std::uint8_t dout() const { return srC; }
+// RUN: };
+// RUN:
 // RUN: static void cycle(ShiftRegBenchView &view) {
 // RUN:   view.clock = 0;
 // RUN:   ShiftRegBench_eval(view.state);
@@ -55,20 +72,30 @@
 // RUN:   std::uint64_t checksum = 0;
 // RUN:   std::size_t passedCount = 0;
 // RUN:   std::size_t firstFail = std::numeric_limits<std::size_t>::max();
+// RUN:   std::size_t stepChecks = 0;
 // RUN:
 // RUN:   for (std::size_t caseIndex = 0; caseIndex < caseCount; ++caseIndex) {
 // RUN:     auto *slot = states.data() + caseIndex * stride;
 // RUN:     initSlot(slot);
 // RUN:     ShiftRegBenchView view(slot);
+// RUN:     RefShiftReg ref;
 // RUN:     view.en = 1;
 // RUN:     view.clock = 0;
 // RUN:     view.din = inputFor(caseIndex, 0);
 // RUN:     ShiftRegBench_eval(view.state);
+// RUN:     bool casePassed = view.dout == ref.dout();
+// RUN:     ++stepChecks;
 // RUN:     const auto steps = stepsFor(caseIndex);
 // RUN:     for (std::size_t stepIndex = 0; stepIndex < steps; ++stepIndex) {
-// RUN:       view.din = inputFor(caseIndex, stepIndex);
+// RUN:       const auto din = inputFor(caseIndex, stepIndex);
+// RUN:       view.din = din;
 // RUN:       cycle(view);
+// RUN:       ref.cycle(true, din);
+// RUN:       casePassed &= view.dout == ref.dout();
+// RUN:       ++stepChecks;
 // RUN:     }
+// RUN:     if (!casePassed && firstFail == std::numeric_limits<std::size_t>::max())
+// RUN:       firstFail = caseIndex;
 // RUN:   }
 // RUN:
 // RUN:   for (std::size_t caseIndex = 0; caseIndex < caseCount; ++caseIndex) {
@@ -89,11 +116,14 @@
 // RUN:     return 1;
 // RUN:   if (checksum != 6976)
 // RUN:     return 2;
+// RUN:   if (stepChecks != 168)
+// RUN:     return 3;
 // RUN:
 // RUN:   std::cout << "case_count=" << caseCount
 // RUN:             << " passed_count=" << passedCount
 // RUN:             << " failed_count=" << failedCount
 // RUN:             << " first_fail=none"
+// RUN:             << " step_checks=" << stepChecks
 // RUN:             << " checksum=" << checksum << "\n";
 // RUN:   return 0;
 // RUN: }
@@ -101,7 +131,7 @@
 // RUN: %host_cxx -std=c++17 -I %CIRCT_SOURCE%/tools/arcilator -I %t.dir %t.dir/test.cpp %t.dir/shiftreg.o -o %t.dir/test
 // RUN: %t.dir/test | FileCheck --match-full-lines %s
 //
-// CHECK: case_count=48 passed_count=48 failed_count=0 first_fail=none checksum=6976
+// CHECK: case_count=48 passed_count=48 failed_count=0 first_fail=none step_checks=168 checksum=6976
 
 module {
   hw.module @ShiftRegBench(in %clock : i1, in %en : i1, in %din : i8, out dout : i8) {
