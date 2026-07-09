@@ -94,20 +94,12 @@
 // RUN:       casePassed &= view.dout == ref.dout();
 // RUN:       ++stepChecks;
 // RUN:     }
-// RUN:     if (!casePassed && firstFail == std::numeric_limits<std::size_t>::max())
-// RUN:       firstFail = caseIndex;
-// RUN:   }
-// RUN:
-// RUN:   for (std::size_t caseIndex = 0; caseIndex < caseCount; ++caseIndex) {
-// RUN:     ShiftRegBenchView view(states.data() + caseIndex * stride);
-// RUN:     const auto steps = stepsFor(caseIndex);
 // RUN:     const auto expected = expectedFor(caseIndex, steps);
-// RUN:     if (view.dout != expected) {
-// RUN:       if (firstFail == std::numeric_limits<std::size_t>::max())
-// RUN:         firstFail = caseIndex;
-// RUN:       continue;
-// RUN:     }
-// RUN:     ++passedCount;
+// RUN:     casePassed &= view.dout == expected;
+// RUN:     if (casePassed)
+// RUN:       ++passedCount;
+// RUN:     else if (firstFail == std::numeric_limits<std::size_t>::max())
+// RUN:       firstFail = caseIndex;
 // RUN:     checksum += view.dout;
 // RUN:   }
 // RUN:

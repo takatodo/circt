@@ -118,14 +118,10 @@
 // RUN:       ++stepChecks;
 // RUN:     }
 // RUN:
-// RUN:     if (!casePassed && firstFail == std::numeric_limits<std::size_t>::max())
-// RUN:       firstFail = caseIndex;
-// RUN:   }
-// RUN:
-// RUN:   for (std::size_t caseIndex = 0; caseIndex < caseCount; ++caseIndex) {
-// RUN:     MixedDatapathBenchView view(states.data() + caseIndex * stride);
-// RUN:     if (firstFail == std::numeric_limits<std::size_t>::max())
+// RUN:     if (casePassed)
 // RUN:       ++passedCount;
+// RUN:     else if (firstFail == std::numeric_limits<std::size_t>::max())
+// RUN:       firstFail = caseIndex;
 // RUN:     checksum += view.y;
 // RUN:     checksum += static_cast<std::uint64_t>(view.tap) << 1;
 // RUN:   }
