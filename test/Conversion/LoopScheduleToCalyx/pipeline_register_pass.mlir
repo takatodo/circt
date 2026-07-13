@@ -60,3 +60,34 @@ module {
   }
 }
 
+// -----
+
+// A stage may register an iteration argument unchanged. Its result must still
+// be replaced with the iteration register output before lowering return-value
+// assignments.
+
+// CHECK:      calyx.component @identity_loop
+// CHECK:      calyx.group @ret_assign_0 {
+// CHECK-NEXT:   calyx.assign %ret_arg0_reg.in = %while_0_arg1_reg.out : i32
+
+module {
+  func.func @identity_loop() -> i32 {
+    %zero = arith.constant 0 : i32
+    %four = arith.constant 4 : i32
+    %one = arith.constant 1 : i32
+    %init = arith.constant 42 : i32
+    %result = loopschedule.pipeline II = 1 trip_count = 4
+        iter_args(%counter = %zero, %value = %init) : (i32, i32) -> i32 {
+      %condition = arith.cmpi ult, %counter, %four : i32
+      loopschedule.register %condition : i1
+    } do {
+      %stage:2 = loopschedule.pipeline.stage start = 0 {
+        %next = arith.addi %counter, %one : i32
+        loopschedule.register %value, %next : i32, i32
+      } : i32, i32
+      loopschedule.terminator iter_args(%stage#1, %stage#0),
+          results(%stage#0) : (i32, i32) -> i32
+    }
+    return %result : i32
+  }
+}

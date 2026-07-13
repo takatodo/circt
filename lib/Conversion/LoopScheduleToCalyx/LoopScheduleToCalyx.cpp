@@ -1115,10 +1115,12 @@ class BuildPipelineGroups : public calyx::FuncOpPartialLoweringPattern {
                                            rewriter)
                     : convertCombToSeqGroup(combGroup, pipelineRegister, value,
                                             rewriter);
-
-        // Replace the stage result uses with the register out.
-        stage.getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
       }
+
+      // Every stage result is represented by the output of its pipeline
+      // register. This also applies when the stage operand is already a
+      // register output, such as an unchanged pipeline iteration argument.
+      stage.getResult(i).replaceAllUsesWith(pipelineRegister.getOut());
       updatePrologueAndEpilogue(group);
     }
 
