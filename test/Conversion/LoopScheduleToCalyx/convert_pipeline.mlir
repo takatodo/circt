@@ -288,7 +288,7 @@ module {
   ^bb4:
     %0 = arith.constant 0 : index
     %c1_5 = arith.constant 1 : index
-    loopschedule.pipeline II =  2 trip_count =  20 iter_args(%arg5 = %0) : (index) -> () {
+    loopschedule.pipeline II =  1 trip_count =  20 iter_args(%arg5 = %0) : (index) -> () {
       %6 = arith.cmpi ult, %arg5, %0 : index
       loopschedule.register %6 : i1
     } do {
@@ -310,4 +310,3 @@ module {
     return
   }
 }
-
