@@ -68,6 +68,12 @@ struct MemoryDependenceAnalysis {
   // Construct the analysis from a FuncOp.
   MemoryDependenceAnalysis(Operation *funcOp);
 
+  // The operation-keyed results are updated as clients replace operations.
+  // Copying the analysis would silently disconnect those updates.
+  MemoryDependenceAnalysis(const MemoryDependenceAnalysis &) = delete;
+  MemoryDependenceAnalysis &
+  operator=(const MemoryDependenceAnalysis &) = delete;
+
   // Returns the dependences, if any, that the given Operation depends on.
   ArrayRef<MemoryDependence> getDependences(Operation *);
 

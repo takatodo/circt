@@ -161,9 +161,12 @@ void circt::analysis::MemoryDependenceAnalysis::replaceOp(Operation *oldOp,
                                                           Operation *newOp) {
   // If oldOp had any dependences.
   auto it = results.find(oldOp);
-  if (it != results.end())
+  if (it != results.end()) {
     // Move the dependences to newOp.
-    it->first = newOp;
+    auto dependences = std::move(it->second);
+    results.erase(it);
+    results.try_emplace(newOp, std::move(dependences));
+  }
 
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.

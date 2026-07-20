@@ -111,7 +111,7 @@ ModuloProblem AffineToLoopSchedule::getModuloProblem(CyclicProblem &prob) {
 
 void AffineToLoopSchedule::runOnOperation() {
   // Get dependence analysis for the whole function.
-  auto dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
+  auto &dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
 
   // After dependence analysis, materialize affine structures.
   if (failed(lowerAffineStructures(dependenceAnalysis)))
@@ -130,8 +130,16 @@ void AffineToLoopSchedule::runOnOperation() {
     if (nestedLoops.size() != 1)
       continue;
 
-    ModuloProblem moduloProblem =
-        getModuloProblem(schedulingAnalysis->getProblem(nestedLoops.back()));
+    FailureOr<CyclicProblem *> cyclicProblem =
+        schedulingAnalysis->getProblem(nestedLoops.back());
+    if (failed(cyclicProblem)) {
+      nestedLoops.back().emitError(
+          "failed to construct scheduling problem due to an unknown memory "
+          "dependence");
+      return signalPassFailure();
+    }
+
+    ModuloProblem moduloProblem = getModuloProblem(**cyclicProblem);
 
     // Populate the target operator types.
     if (failed(populateOperatorTypes(nestedLoops, moduloProblem)))

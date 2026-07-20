@@ -175,3 +175,17 @@ func.func @test10(%arg0: memref<5xi32>) {
   }
   return
 }
+
+#dynamic_index = affine_map<()[s0, s1] -> (s0 * s1)>
+
+// CHECK-LABEL: func @unknown_loop_carried_dependence
+func.func @unknown_loop_carried_dependence(
+    %arg0: memref<?x3xi32>, %arg1: index, %arg2: index) {
+  affine.for %arg3 = 1 to 3 {
+    %0 = affine.apply #dynamic_index()[%arg1, %arg2]
+    %1 = affine.load %arg0[%0, %arg3 - 1] : memref<?x3xi32>
+    affine.store %1, %arg0[%0, %arg3] : memref<?x3xi32>
+    // CHECK: } {scheduling_analysis_failed}
+  }
+  return
+}

@@ -35,11 +35,13 @@ namespace analysis {
 struct CyclicSchedulingAnalysis {
   CyclicSchedulingAnalysis(Operation *funcOp, mlir::AnalysisManager &am);
 
-  scheduling::CyclicProblem &getProblem(mlir::affine::AffineForOp forOp);
+  /// Return failure if complete memory dependence information is unavailable.
+  FailureOr<scheduling::CyclicProblem *>
+  getProblem(mlir::affine::AffineForOp forOp);
 
 private:
   void analyzeForOp(mlir::affine::AffineForOp forOp,
-                    MemoryDependenceAnalysis memoryAnalysis);
+                    MemoryDependenceAnalysis &memoryAnalysis);
 
   DenseMap<Operation *, scheduling::CyclicProblem> problems;
 };
