@@ -1565,10 +1565,27 @@ private:
   std::shared_ptr<calyx::CalyxLoweringState> loweringState = nullptr;
 };
 
+/// The current control construction does not implement modulo phases, so it
+/// cannot preserve initiation intervals greater than one.
+static LogicalResult validatePipelineII(ModuleOp module) {
+  WalkResult result = module.walk([](LoopSchedulePipelineOp pipeline) {
+    if (pipeline.getII() == 1)
+      return WalkResult::advance();
+    pipeline.emitError("only pipelines with II = 1 are supported");
+    return WalkResult::interrupt();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 void LoopScheduleToCalyxPass::runOnOperation() {
   // Clear internal state. See https://github.com/llvm/circt/issues/3235
   loweringState.reset();
   partialPatternRes = LogicalResult::failure();
+
+  if (failed(validatePipelineII(getOperation()))) {
+    signalPassFailure();
+    return;
+  }
 
   std::string topLevelFunction;
   if (failed(setTopLevelFunction(getOperation(), topLevelFunction))) {
