@@ -10,6 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_RTG_IR_RTGOPS_TD
+#define CIRCT_DIALECT_RTG_IR_RTGOPS_TD
+
 include "mlir/IR/BuiltinTypes.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/CommonTypeConstraints.td"
@@ -24,6 +27,9 @@ include "circt/Dialect/RTG/IR/RTGAttributes.td"
 include "circt/Dialect/RTG/IR/RTGInterfaces.td"
 include "circt/Dialect/RTG/IR/RTGISAAssemblyInterfaces.td"
 include "circt/Dialect/Emit/EmitOpInterfaces.td"
+include "circt/Dialect/RTG/IR/RTGDialect.td"
+include "circt/Dialect/RTG/IR/RTGTypes.td"
+include "circt/Dialect/RTG/IR/RTGAttributes.td"
 
 // Resource representing the RNG state. Operations that read from or write to
 // the RNG state should declare effects on this resource to prevent CSE and DCE.
@@ -280,6 +286,21 @@ def StringToLabelOp : RTGOp<"string_to_label", [Pure]> {
   let assemblyFormat = "$string attr-dict";
 
   let hasFolder = 1;
+}
+
+def StringToASCIIArrayOp : RTGOp<"string_to_ascii_array", [Pure]> {
+  let summary = "converts a string to an array of 8-bit ASCII immediates";
+  let description = [{
+    This operation decomposes a string into an array of 8-bit immediates, one
+    per byte, in the same order as the string. No NULL terminator is appended.
+  }];
+
+  let arguments = (ins StringType:$string);
+  let results = (outs ArrayTypeOf<I8>:$result);
+
+  let assemblyFormat = "$string `:` qualified(type($result)) attr-dict";
+
+  let hasCanonicalizeMethod = 1;
 }
 
 def LabelVisibilityAttr : I32EnumAttr<"LabelVisibility",
@@ -1192,3 +1213,5 @@ def SegmentOp : RTGISAOp<"segment", [
 
   let assemblyFormat = "$kind attr-dict-with-keyword $bodyRegion";
 }
+
+#endif // CIRCT_DIALECT_RTG_IR_RTGOPS_TD
