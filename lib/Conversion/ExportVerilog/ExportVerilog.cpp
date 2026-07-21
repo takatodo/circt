@@ -3923,6 +3923,20 @@ EmittedProperty PropertyEmitter::visitLTL(ltl::NonConsecutiveRepeatOp op) {
 }
 
 EmittedProperty PropertyEmitter::visitLTL(ltl::NotOp op) {
+  // Emit `not (s_eventually X)` as `always ...` by duality, pulling the
+  // quantifier to the top and cancelling any inner negation.
+  if (auto ev = op.getInput().getDefiningOp<ltl::EventuallyOp>()) {
+    ps << "always" << PP::space;
+    if (auto innerNot = ev.getInput().getDefiningOp<ltl::NotOp>()) {
+      // `not(strong_eventually(not(X)))` -> `always X`.
+      emitNestedProperty(innerNot.getInput(), PropertyPrecedence::Qualifier);
+    } else {
+      // `not(strong_eventually(X))` -> `always (not X)`.
+      ps << "not" << PP::space;
+      emitNestedProperty(ev.getInput(), PropertyPrecedence::Unary);
+    }
+    return {PropertyPrecedence::Qualifier};
+  }
   ps << "not" << PP::space;
   emitNestedProperty(op.getInput(), PropertyPrecedence::Unary);
   return {PropertyPrecedence::Unary};
@@ -5752,9 +5766,12 @@ void StmtEmitter::emitInstancePortList(Operation *op,
   ps << " (";
 
   // Get the max port name length so we can align the '('.
+  // Exclude outlier names that span the whole line from the alignment column.
   size_t maxNameLength = 0;
   for (auto &elt : modPortInfo) {
-    maxNameLength = std::max(maxNameLength, elt.getVerilogName().size());
+    size_t nameLength = elt.getVerilogName().size();
+    if (nameLength <= state.options.emittedLineLength / 3)
+      maxNameLength = std::max(maxNameLength, nameLength);
   }
 
   auto getWireForValue = [&](Value result) {
@@ -5805,7 +5822,11 @@ void StmtEmitter::emitInstancePortList(Operation *op,
     ps.scopedBox(isZeroWidth ? PP::neverbox : PP::ibox2, [&]() {
       auto modPortName = modPort.getVerilogName();
       ps << "." << PPExtString(modPortName);
-      ps.spaces(maxNameLength - modPortName.size() + 1);
+      // Align to the column if fits, else no-break and accept possible overrun.
+      if (modPortName.size() <= maxNameLength)
+        ps.spaces(maxNameLength - modPortName.size() + 1);
+      else
+        ps.nbsp();
       ps << "(";
       ps.scopedBox(PP::ibox0, [&]() {
         // Emit the value as an expression.
@@ -6371,11 +6392,14 @@ void ModuleEmitter::emitBind(BindOp op) {
     ModulePortInfo childPortInfo(cast<PortList>(childMod).getPortList());
 
     // Get the max port name length so we can align the '('.
+    // Exclude outlier names longer than the line.
     size_t maxNameLength = 0;
     for (auto &elt : childPortInfo) {
       auto portName = elt.getVerilogName();
       elt.name = Builder(inst.getContext()).getStringAttr(portName);
-      maxNameLength = std::max(maxNameLength, elt.getName().size());
+      size_t nameLength = elt.getName().size();
+      if (nameLength <= state.options.emittedLineLength / 3)
+        maxNameLength = std::max(maxNameLength, nameLength);
     }
 
     SmallVector<Value> instPortValues(childPortInfo.size());
@@ -6416,7 +6440,9 @@ void ModuleEmitter::emitBind(BindOp op) {
       }
 
       ps << "." << PPExtString(elt.getName());
-      ps.nbsp(maxNameLength - elt.getName().size());
+      // Align to the column if fits, else no-break and accept possible overrun.
+      if (elt.getName().size() <= maxNameLength)
+        ps.nbsp(maxNameLength - elt.getName().size());
       ps << " (";
       llvm::SmallPtrSet<Operation *, 4> ops;
       if (elt.isOutput()) {
