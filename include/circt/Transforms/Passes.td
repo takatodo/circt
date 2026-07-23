@@ -187,6 +187,38 @@ def AffineSlidingWindowReuse :
   let dependentDialects = ["mlir::affine::AffineDialect"];
 }
 
+def AffineSlidingReductionReuse :
+    Pass<"affine-sliding-reduction-reuse", "::mlir::func::FuncOp"> {
+  let summary = "Carry partial sliding-window folds across loop iterations";
+  let description = [{
+    Rewrites an associative and commutative fold over a sliding window of
+    affine loads. Loads with the same offset along the loop induction variable
+    form one column. The pass folds and carries every leading column through
+    affine.for iter_args, then loads and folds only the newest column in each
+    iteration.
+
+    The transform supports flagless `arith.addi` and `arith.muli`,
+    `arith.maxsi`, and `arith.addf` when every node permits reassociation.
+    Integer operations with overflow flags and floating-point additions with
+    an explicit rounding mode are rejected.
+
+    The transformation requires a unit-step loop with an exact constant trip
+    count greater than one, direct affine-load leaves from one loop-invariant
+    memref, one sliding subscript with induction-variable coefficient one,
+    identical loop-invariant row structure in every contiguous column, no
+    additional users of leading-column loads, and no operation that may modify
+    the source. Unsupported affine expressions, arithmetic overflow during
+    access analysis, and unknown memory effects conservatively leave the loop
+    unchanged.
+
+    For a window with C columns and R rows, steady-state loads decrease from
+    C*R to R and fold operations decrease from C*R-1 to (R-1)+(C-1), at the
+    cost of C-1 loop-carried values.
+  }];
+  let dependentDialects = ["mlir::affine::AffineDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def IndexSwitchToIf : Pass<"switch-to-if", "::mlir::ModuleOp"> {
   let summary = "Index switch to if";
   let description = [{
