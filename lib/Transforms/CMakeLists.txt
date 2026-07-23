@@ -1,4 +1,5 @@
 add_circt_library(CIRCTTransforms
+  AffineSlidingReductionReuse.cpp
   AffineSlidingReuseAnalysis.cpp
   AffineSlidingWindowReuse.cpp
   CellIFT.cpp
