@@ -1,0 +1,797 @@
+// RUN: circt-opt --affine-sliding-window-reuse %s > %t.once
+// RUN: circt-opt --affine-sliding-window-reuse --affine-sliding-window-reuse %s > %t.twice
+// RUN: diff %t.once %t.twice
+// RUN: FileCheck %s < %t.once
+// RUN: circt-opt --affine-sliding-window-reuse --canonicalize %s > %t.canonicalized
+// RUN: circt-opt %t.canonicalized > /dev/null
+
+// CHECK-LABEL: func.func @three_tap
+// CHECK: %[[DISTINCT:.*]]:2 = memref.distinct_objects
+// CHECK-NEXT: %[[X0:.*]] = affine.load %[[DISTINCT]]#0[0] {test.marker = "x0"} : memref<10xi32>
+// CHECK-NEXT: %[[X1:.*]] = affine.load %[[DISTINCT]]#0[1] {test.marker = "x1"} : memref<10xi32>
+// CHECK-NEXT: %{{.*}}:2 = affine.for %[[I:.*]] = 0 to 8
+// CHECK-SAME: iter_args(%[[S0:.*]] = %[[X0]], %[[S1:.*]] = %[[X1]])
+// CHECK-NEXT: %[[NEXT:.*]] = affine.load %[[DISTINCT]]#0[%[[I]] + 2] : memref<10xi32>
+// CHECK-NEXT: %[[SUM0:.*]] = arith.addi %[[S0]], %[[S1]] : i32
+// CHECK-NEXT: %[[SUM1:.*]] = arith.addi %[[SUM0]], %[[NEXT]] : i32
+// CHECK-NEXT: affine.store %[[SUM1]], %[[DISTINCT]]#1[%[[I]]] : memref<8xi32>
+// CHECK-NEXT: affine.yield %[[S1]], %[[NEXT]] : i32, i32
+// CHECK-NEXT: } {test.marker = "loop"}
+func.func @three_tap(%src: memref<10xi32>, %dst: memref<8xi32>) {
+  %src_distinct, %dst_distinct = memref.distinct_objects %src, %dst
+    : memref<10xi32>, memref<8xi32>
+  affine.for %i = 0 to 8 {
+    %x0 = affine.load %src_distinct[%i] {test.marker = "x0"} : memref<10xi32>
+    %x1 = affine.load %src_distinct[%i + 1] {test.marker = "x1"} : memref<10xi32>
+    %x2 = affine.load %src_distinct[%i + 2] : memref<10xi32>
+    %sum0 = arith.addi %x0, %x1 : i32
+    %sum1 = arith.addi %sum0, %x2 : i32
+    affine.store %sum1, %dst_distinct[%i] : memref<8xi32>
+  } {test.marker = "loop"}
+  return
+}
+
+// A window may start at any constant offset. The preloads are relative to the
+// loop's lower bound, not necessarily absolute indices zero and one.
+
+// CHECK-LABEL: func.func @nonzero_start
+// CHECK: %[[X4:.*]] = affine.load %[[SRC:.*]][4] : memref<10xi32>
+// CHECK-NEXT: %[[X5:.*]] = affine.load %[[SRC]][5] : memref<10xi32>
+// CHECK: %{{.*}}:2 = affine.for %[[I:.*]] = 1 to 5
+// CHECK-SAME: iter_args(%[[S3:.*]] = %[[X4]], %[[S4:.*]] = %[[X5]])
+// CHECK: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + 5] : memref<10xi32>
+// CHECK: %[[SUM:.*]] = arith.addi %[[S3]], %[[S4]] : i32
+// CHECK: %[[SUM2:.*]] = arith.addi %[[SUM]], %[[NEXT]] : i32
+// CHECK: affine.yield %[[S4]], %[[NEXT]] : i32, i32
+func.func @nonzero_start(%src: memref<10xi32>) {
+  affine.for %i = 1 to 5 {
+    %x3 = affine.load %src[%i + 3] : memref<10xi32>
+    %x4 = affine.load %src[%i + 4] : memref<10xi32>
+    %x5 = affine.load %src[%i + 5] : memref<10xi32>
+    %sum0 = arith.addi %x3, %x4 : i32
+    %sum1 = arith.addi %sum0, %x5 : i32
+  }
+  return
+}
+
+// Existing iter_args and externally used results stay first; window state is
+// appended. Replacing a load rewrites all of its uses, not just a recognized
+// arithmetic chain.
+
+// CHECK-LABEL: func.func @existing_iter_args_and_multiple_uses
+// CHECK: %[[INIT:.*]] = arith.constant 0 : i32
+// CHECK: %[[PRELOAD:.*]] = affine.load %[[SRC:.*]][0] : memref<5xi32>
+// CHECK: %[[RESULT:.*]]:2 = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[ACC:.*]] = %[[INIT]], %[[STATE:.*]] = %[[PRELOAD]])
+// CHECK: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + 1] : memref<5xi32>
+// CHECK: %[[TWICE:.*]] = arith.addi %[[STATE]], %[[STATE]] : i32
+// CHECK: %[[TOTAL:.*]] = arith.addi %[[ACC]], %[[TWICE]] : i32
+// CHECK: %[[UPDATED:.*]] = arith.addi %[[TOTAL]], %[[NEXT]] : i32
+// CHECK: affine.yield %[[UPDATED]], %[[NEXT]] : i32, i32
+// CHECK: return %[[RESULT]]#0 : i32
+func.func @existing_iter_args_and_multiple_uses(%src: memref<5xi32>) -> i32 {
+  %zero = arith.constant 0 : i32
+  %result = affine.for %i = 0 to 4 iter_args(%acc = %zero) -> i32 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    %twice = arith.addi %x0, %x0 : i32
+    %total = arith.addi %acc, %twice : i32
+    %updated = arith.addi %total, %x1 : i32
+    affine.yield %updated : i32
+  }
+  return %result : i32
+}
+
+#dynamic_upper = affine_map<()[s0] -> (s0 + 4)>
+#scaled_dynamic_upper = affine_map<()[s0] -> (2 * s0 + 4)>
+#decreasing_upper = affine_map<()[s0] -> (s0 - 1)>
+#plus_one = affine_map<(d0) -> (d0 + 1)>
+#identity_bound = affine_map<(d0) -> (d0)>
+#multiple_lower = affine_map<() -> (0, 1)>
+#partly_empty_upper = affine_map<() -> (4, -1)>
+#times_large = affine_map<(d0) -> (d0 * 4611686018427387904)>
+#times_2p32 = affine_map<(d0) -> (d0 * 4294967296)>
+#times_four = affine_map<(d0) -> (d0 * 4)>
+#times_four_plus_four = affine_map<(d0) -> (d0 * 4 + 4)>
+#add_pair = affine_map<(d0, d1) -> (d0 + d1)>
+#halved_lower = affine_map<(d0) -> (d0 floordiv 2)>
+#halved_upper = affine_map<(d0) -> (d0 floordiv 2 + 4)>
+#near_max_lower = affine_map<()[s0] -> (s0 + 9223372036854775805)>
+#near_max_upper = affine_map<()[s0] -> (s0 + 9223372036854775807)>
+#near_max_apply = affine_map<(d0) -> (d0 + 9223372036854775807)>
+#plus_two_symbol = affine_map<()[s0] -> (s0 + 2)>
+
+func.func private @unknown(memref<5xi32>)
+
+// A symbolic lower bound is allowed when affine analysis can still prove a
+// positive constant trip count. Preload indices are formed from the original
+// lower-bound map and operands.
+
+// CHECK-LABEL: func.func @dynamic_lower_bound(
+// CHECK-SAME: %[[SRC:.*]]: memref<?xi32>, %[[LB:.*]]: index)
+// CHECK: %[[PREV:.*]] = affine.load %[[SRC]][symbol(%[[LB]]) - 1] : memref<?xi32>
+// CHECK-NEXT: %[[CURRENT:.*]] = affine.load %[[SRC]][symbol(%[[LB]])] : memref<?xi32>
+// CHECK: %{{.*}}:2 = affine.for %[[I:.*]] = %[[LB]] to #{{.*}}()[%[[LB]]]
+// CHECK-SAME: iter_args(%[[S0:.*]] = %[[PREV]], %[[S1:.*]] = %[[CURRENT]])
+// CHECK: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + 1] : memref<?xi32>
+// CHECK: affine.yield %[[S1]], %[[NEXT]] : i32, i32
+func.func @dynamic_lower_bound(%src: memref<?xi32>, %lb: index) {
+  affine.for %i = %lb to #dynamic_upper()[%lb] {
+    %previous = affine.load %src[%i - 1] : memref<?xi32>
+    %current = affine.load %src[%i] : memref<?xi32>
+    %next = affine.load %src[%i + 1] : memref<?xi32>
+    %sum0 = arith.addi %previous, %current : i32
+    %sum1 = arith.addi %sum0, %next : i32
+  }
+  return
+}
+
+// An access not expressible as IV plus a constant is not part of the window.
+// It remains in place while the recognized accesses are reused.
+
+// CHECK-LABEL: func.func @unrecognized_access_coexists
+// CHECK: %[[PRELOAD:.*]] = affine.load %[[SRC:.*]][0] : memref<?xi32>
+// CHECK: %{{.*}} = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[STATE:.*]] = %[[PRELOAD]])
+// CHECK: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + 1] : memref<?xi32>
+// CHECK-NEXT: %[[OTHER:.*]] = affine.load %[[SRC]][symbol(%{{.*}})] : memref<?xi32>
+// CHECK: %[[SUM:.*]] = arith.addi %[[STATE]], %[[NEXT]] : i32
+// CHECK: arith.addi %[[SUM]], %[[OTHER]] : i32
+// CHECK: affine.yield %[[NEXT]] : i32
+func.func @unrecognized_access_coexists(%src: memref<?xi32>, %j: index) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+    %other = affine.load %src[symbol(%j)] : memref<?xi32>
+    %sum0 = arith.addi %x0, %x1 : i32
+    %sum1 = arith.addi %sum0, %other : i32
+  }
+  return
+}
+
+// An invariant symbolic base is outside this pass's rank-one IV-plus-constant
+// contract. Dropping the base while constructing preloads would change which
+// elements are read.
+
+// CHECK-LABEL: func.func @invariant_access_base
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @invariant_access_base(%src: memref<?xi32>, %base: index) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i + symbol(%base)] : memref<?xi32>
+    %x1 = affine.load %src[%i + symbol(%base) + 1] : memref<?xi32>
+  }
+  return
+}
+
+// Fully composing affine.apply chains proves that these accesses are the same
+// contiguous window as direct IV-plus-constant accesses.
+
+// CHECK-LABEL: func.func @composed_affine_apply
+// CHECK: %[[X0:.*]] = affine.load %[[SRC:.*]][0] : memref<6xi32>
+// CHECK-NEXT: %[[X1:.*]] = affine.load %[[SRC]][1] : memref<6xi32>
+// CHECK: %{{.*}}:2 = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[S0:.*]] = %[[X0]], %[[S1:.*]] = %[[X1]])
+// CHECK: %[[I1:.*]] = affine.apply #{{.*}}(%[[I]])
+// CHECK-NEXT: %[[I2:.*]] = affine.apply #{{.*}}(%[[I1]])
+// CHECK-NEXT: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I2]]] : memref<6xi32>
+// CHECK: %[[SUM0:.*]] = arith.addi %[[S0]], %[[S1]] : i32
+// CHECK: %[[SUM1:.*]] = arith.addi %[[SUM0]], %[[NEXT]] : i32
+// CHECK: affine.yield %[[S1]], %[[NEXT]] : i32, i32
+func.func @composed_affine_apply(%src: memref<6xi32>) {
+  affine.for %i = 0 to 4 {
+    %i1 = affine.apply #plus_one(%i)
+    %i2 = affine.apply #plus_one(%i1)
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x1 = affine.load %src[%i1] : memref<6xi32>
+    %x2 = affine.load %src[%i2] : memref<6xi32>
+    %sum0 = arith.addi %x0, %x1 : i32
+    %sum1 = arith.addi %sum0, %x2 : i32
+  }
+  return
+}
+
+// Constant SSA operands in affine indices are folded when proving offsets.
+// This spelling is common in imported HLS kernels.
+
+// CHECK-LABEL: func.func @constant_ssa_offsets
+// CHECK: %[[C1:.*]] = arith.constant 1 : index
+// CHECK-NEXT: %[[C2:.*]] = arith.constant 2 : index
+// CHECK-NEXT: %[[X0:.*]] = affine.load %[[SRC:.*]][0] : memref<6xi32>
+// CHECK-NEXT: %[[X1:.*]] = affine.load %[[SRC]][1] : memref<6xi32>
+// CHECK-NEXT: %{{.*}}:2 = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[S0:.*]] = %[[X0]], %[[S1:.*]] = %[[X1]])
+// CHECK-NEXT: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + %[[C2]]] : memref<6xi32>
+// CHECK: affine.yield %[[S1]], %[[NEXT]] : i32, i32
+func.func @constant_ssa_offsets(%src: memref<6xi32>) {
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x1 = affine.load %src[%i + %c1] : memref<6xi32>
+    %x2 = affine.load %src[%i + %c2] : memref<6xi32>
+    %sum0 = arith.addi %x0, %x1 : i32
+    %sum1 = arith.addi %sum0, %x2 : i32
+  }
+  return
+}
+
+// Disjoint contiguous windows on the same flattened source are reused
+// independently. This is the access shape used by row-wise 2D stencils.
+
+// CHECK-LABEL: func.func @disjoint_windows_same_source
+// CHECK: %[[X0:.*]] = affine.load %[[SRC:.*]][0] : memref<14xi32>
+// CHECK-NEXT: %[[X1:.*]] = affine.load %[[SRC]][1] : memref<14xi32>
+// CHECK-NEXT: %[[Y0:.*]] = affine.load %[[SRC]][8] : memref<14xi32>
+// CHECK-NEXT: %[[Y1:.*]] = affine.load %[[SRC]][9] : memref<14xi32>
+// CHECK-NEXT: %{{.*}}:4 = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[SX0:.*]] = %[[X0]], %[[SX1:.*]] = %[[X1]], %[[SY0:.*]] = %[[Y0]], %[[SY1:.*]] = %[[Y1]])
+// CHECK-NEXT: %[[XNEXT:.*]] = affine.load %[[SRC]][%[[I]] + 2] : memref<14xi32>
+// CHECK-NEXT: %[[YNEXT:.*]] = affine.load %[[SRC]][%[[I]] + 10] : memref<14xi32>
+// CHECK-NEXT: %[[SUM0:.*]] = arith.addi %[[SX0]], %[[SX1]] : i32
+// CHECK-NEXT: %[[SUM1:.*]] = arith.addi %[[SUM0]], %[[XNEXT]] : i32
+// CHECK-NEXT: %[[SUM2:.*]] = arith.addi %[[SY0]], %[[SY1]] : i32
+// CHECK-NEXT: %[[SUM3:.*]] = arith.addi %[[SUM2]], %[[YNEXT]] : i32
+// CHECK-NEXT: %[[SUM4:.*]] = arith.addi %[[SUM1]], %[[SUM3]] : i32
+// CHECK-NEXT: affine.yield %[[SX1]], %[[XNEXT]], %[[SY1]], %[[YNEXT]] : i32, i32, i32, i32
+func.func @disjoint_windows_same_source(%src: memref<14xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<14xi32>
+    %x1 = affine.load %src[%i + 1] : memref<14xi32>
+    %x2 = affine.load %src[%i + 2] : memref<14xi32>
+    %y0 = affine.load %src[%i + 8] : memref<14xi32>
+    %y1 = affine.load %src[%i + 9] : memref<14xi32>
+    %y2 = affine.load %src[%i + 10] : memref<14xi32>
+    %sum0 = arith.addi %x0, %x1 : i32
+    %sum1 = arith.addi %sum0, %x2 : i32
+    %sum2 = arith.addi %y0, %y1 : i32
+    %sum3 = arith.addi %sum2, %y2 : i32
+    %sum4 = arith.addi %sum1, %sum3 : i32
+  }
+  return
+}
+
+// Nested loops use the same transformation. The first-window preload remains
+// inside the outer loop and immediately precedes the rewritten inner loop.
+
+// CHECK-LABEL: func.func @nested_loop
+// CHECK: affine.for %{{.*}} = 0 to 2 {
+// CHECK-NEXT: %[[PRELOAD:.*]] = affine.load %[[SRC:.*]][0] : memref<5xi32>
+// CHECK-NEXT: %{{.*}} = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[STATE:.*]] = %[[PRELOAD]])
+// CHECK: %[[NEXT:.*]] = affine.load %[[SRC]][%[[I]] + 1] : memref<5xi32>
+// CHECK: %[[SUM:.*]] = arith.addi %[[STATE]], %[[NEXT]] : i32
+// CHECK: affine.yield %[[NEXT]] : i32
+func.func @nested_loop(%src: memref<5xi32>) {
+  affine.for %outer = 0 to 2 {
+    affine.for %i = 0 to 4 {
+      %x0 = affine.load %src[%i] : memref<5xi32>
+      %x1 = affine.load %src[%i + 1] : memref<5xi32>
+      %sum = arith.addi %x0, %x1 : i32
+    }
+  }
+  return
+}
+
+// A recursively-effectful container does not block reuse when its nested
+// operations only read memory.
+
+// CHECK-LABEL: func.func @nested_read_only
+// CHECK: %[[PRELOAD:.*]] = affine.load %[[SRC:.*]][0] : memref<6xi32>
+// CHECK: affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[STATE:.*]] = %[[PRELOAD]])
+// CHECK: scf.if
+// CHECK: affine.load %[[SRC]][%[[I]] + 2] : memref<6xi32>
+// CHECK: affine.yield %{{.*}} : i32
+func.func @nested_read_only(%src: memref<6xi32>, %condition: i1) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x1 = affine.load %src[%i + 1] : memref<6xi32>
+    scf.if %condition {
+      %nested = affine.load %src[%i + 2] : memref<6xi32>
+    }
+  }
+  return
+}
+
+// Independent windows on different sources are both reused. The pass
+// restarts its walk after rebuilding a loop, so neither source is skipped.
+
+// CHECK-LABEL: func.func @two_sources
+// CHECK: %[[A0:.*]] = affine.load %[[A:.*]][0] : memref<5xi32>
+// CHECK-NEXT: %[[B0:.*]] = affine.load %[[B:.*]][0] : memref<5xi32>
+// CHECK: %{{.*}}:2 = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[SA:.*]] = %[[A0]], %[[SB:.*]] = %[[B0]])
+// CHECK: %[[ANEXT:.*]] = affine.load %[[A]][%[[I]] + 1] : memref<5xi32>
+// CHECK-NEXT: %[[BNEXT:.*]] = affine.load %[[B]][%[[I]] + 1] : memref<5xi32>
+// CHECK: affine.yield %[[ANEXT]], %[[BNEXT]] : i32, i32
+func.func @two_sources(%a: memref<5xi32>, %b: memref<5xi32>) {
+  affine.for %i = 0 to 4 {
+    %a0 = affine.load %a[%i] : memref<5xi32>
+    %a1 = affine.load %a[%i + 1] : memref<5xi32>
+    %b0 = affine.load %b[%i] : memref<5xi32>
+    %b1 = affine.load %b[%i + 1] : memref<5xi32>
+    %sum0 = arith.addi %a0, %a1 : i32
+    %sum1 = arith.addi %b0, %b1 : i32
+    %sum2 = arith.addi %sum0, %sum1 : i32
+  }
+  return
+}
+
+// The remaining functions exercise conservative rejection. They must retain
+// their original result-less affine.for form.
+
+// A single iteration has no cross-iteration reuse to exploit.
+
+// CHECK-LABEL: func.func @single_trip
+// CHECK: affine.for %{{.*}} = 3 to 4 {
+func.func @single_trip(%src: memref<5xi32>) {
+  affine.for %i = 3 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @zero_trip
+// CHECK: affine.for %{{.*}} = 4 to 4 {
+func.func @zero_trip(%src: memref<8xi32>) {
+  affine.for %i = 4 to 4 {
+    %x0 = affine.load %src[%i] : memref<8xi32>
+    %x1 = affine.load %src[%i + 1] : memref<8xi32>
+  }
+  return
+}
+
+// An affine.for lower bound is the maximum of all map results. Selecting only
+// one result would construct preloads for the wrong first iteration.
+
+// CHECK-LABEL: func.func @multiple_lower_bounds
+// CHECK: affine.for %{{.*}} = max #{{.*}}() to 5 {
+// CHECK-NOT: iter_args
+func.func @multiple_lower_bounds(%src: memref<6xi32>) {
+  affine.for %i = max #multiple_lower() to 5 {
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x1 = affine.load %src[%i + 1] : memref<6xi32>
+  }
+  return
+}
+
+// An affine.for upper bound is the minimum of all map results. Every result
+// must therefore describe a positive span before preloading is safe.
+
+// CHECK-LABEL: func.func @empty_multiple_upper_bounds
+// CHECK-NEXT: affine.for %{{.*}} = 0 to min #{{.*}}() {
+func.func @empty_multiple_upper_bounds(%src: memref<8xi32>) {
+  affine.for %i = 0 to min #partly_empty_upper() {
+    %x0 = affine.load %src[%i] : memref<8xi32>
+    %x1 = affine.load %src[%i + 1] : memref<8xi32>
+  }
+  return
+}
+
+// Computing this trip count in signed i64 overflows. Mathematically the loop
+// is empty and must not gain an unconditional preload.
+
+// CHECK-LABEL: func.func @overflowing_zero_trip
+// CHECK-NEXT: affine.for %{{.*}} = 9223372036854775806 to -9223372036854775807 {
+func.func @overflowing_zero_trip(%src: memref<1xi32>) {
+  affine.for %i = 9223372036854775806 to -9223372036854775807 {
+    %x0 = affine.load %src[%i] : memref<1xi32>
+    %x1 = affine.load %src[%i + 1] : memref<1xi32>
+  }
+  return
+}
+
+// The same overflow can be hidden behind constant SSA operands and
+// affine.apply chains.
+
+// CHECK-LABEL: func.func @ssa_overflowing_zero_trip
+// CHECK: %[[LB0:.*]] = arith.constant 9223372036854775806 : index
+// CHECK-NEXT: %[[UB0:.*]] = arith.constant -9223372036854775807 : index
+// CHECK-NEXT: %[[LB:.*]] = affine.apply #{{.*}}(%[[LB0]])
+// CHECK-NEXT: %[[UB:.*]] = affine.apply #{{.*}}(%[[UB0]])
+// CHECK-NEXT: affine.for %{{.*}} = %[[LB]] to %[[UB]] {
+func.func @ssa_overflowing_zero_trip(%src: memref<1xi32>) {
+  %lb0 = arith.constant 9223372036854775806 : index
+  %ub0 = arith.constant -9223372036854775807 : index
+  %lb = affine.apply #identity_bound(%lb0)
+  %ub = affine.apply #identity_bound(%ub0)
+  affine.for %i = %lb to %ub {
+    %x0 = affine.load %src[%i] : memref<1xi32>
+    %x1 = affine.load %src[%i + 1] : memref<1xi32>
+  }
+  return
+}
+
+// Exact composition can produce a positive mathematical span wider than the
+// uint64_t result type. It must not be truncated into a plausible trip count.
+
+// CHECK-LABEL: func.func @too_wide_trip_span
+// CHECK: affine.for %{{.*}} = 0 to %{{.*}} {
+// CHECK-NOT: iter_args
+func.func @too_wide_trip_span(%src: memref<?xi32>) {
+  %one = arith.constant 1 : index
+  %large = affine.apply #times_large(%one)
+  %tooWide = affine.apply #times_four_plus_four(%large)
+  affine.for %i = 0 to %tooWide {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// Expanding access-minus-IV must also fail closed on signed overflow.
+
+// CHECK-LABEL: func.func @overflowing_access_offset
+// CHECK: %[[N:.*]] = arith.constant -9223372036854775807 : index
+// CHECK-NEXT: affine.for %{{.*}} = -9223372036854775807 to -9223372036854775805 {
+func.func @overflowing_access_offset(%src: memref<4xi8>) {
+  %n = arith.constant -9223372036854775807 : index
+  affine.for %i = -9223372036854775807 to -9223372036854775805 {
+    %x0 = affine.load %src[%i - symbol(%n) + 1] : memref<4xi8>
+    %x1 = affine.load %src[%i - symbol(%n) + 2] : memref<4xi8>
+  }
+  return
+}
+
+// Combining a valid lower bound with a valid access offset must not overflow
+// while constructing the preload map. For n=-9223372036854775805, the
+// original loop runs from 0 to 2 and every access is in bounds.
+
+// CHECK-LABEL: func.func @overflowing_preload_composition
+// CHECK-NOT: affine.load
+// CHECK: affine.for %{{.*}} = #{{.*}}()[%{{.*}}] to #{{.*}}()[%{{.*}}] {
+func.func @overflowing_preload_composition(
+    %src: memref<6xi8>, %n: index) {
+  affine.for %i = #near_max_lower()[%n] to #near_max_upper()[%n] {
+    %x0 = affine.load %src[%i + 3] : memref<6xi8>
+    %x1 = affine.load %src[%i + 4] : memref<6xi8>
+  }
+  return
+}
+
+// The lower-bound constant may be hidden behind an affine.apply operand.
+// Composing the first access at n=-INT64_MAX is mathematically index 1, but
+// folding INT64_MAX + 1 in an int64 affine expression would overflow.
+
+// CHECK-LABEL: func.func @overflowing_preload_operand_composition
+// CHECK: %[[LB:.*]] = affine.apply
+// CHECK: %[[RESULT:.*]] = affine.for %[[I:.*]] = %[[LB]]
+// CHECK-SAME: iter_args(%[[ACC:.*]] = %{{.*}}) -> (i8)
+// CHECK-NEXT: %[[X1:.*]] = affine.load %{{.*}}[%[[I]] + 1]
+// CHECK-NEXT: %[[X2:.*]] = affine.load %{{.*}}[%[[I]] + 2]
+func.func @overflowing_preload_operand_composition(
+    %src: memref<?xi8>, %n: index) -> i8 {
+  %zero = arith.constant 0 : i8
+  %lb = affine.apply #near_max_apply(%n)
+  %result = affine.for %i = %lb to #plus_two_symbol()[%lb]
+      iter_args(%acc = %zero) -> i8 {
+    %x1 = affine.load %src[%i + 1] : memref<?xi8>
+    %x2 = affine.load %src[%i + 2] : memref<?xi8>
+    %sum = arith.addi %x1, %x2 : i8
+    %next = arith.addi %acc, %sum : i8
+    affine.yield %next : i8
+  }
+  return %result : i8
+}
+
+// Multiplication can overflow only after composing otherwise valid maps. If
+// 2^64 * iv were incorrectly wrapped to zero, adding iv would disguise the
+// overflow as the supported unit induction coefficient.
+
+// CHECK-LABEL: func.func @overflowing_composed_scale
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @overflowing_composed_scale(%src: memref<?xi8>) {
+  affine.for %i = 0 to 4 {
+    %large = affine.apply #times_large(%i)
+    %overflow = affine.apply #times_four(%large)
+    %wrappedToOne = affine.apply #add_pair(%overflow, %i)
+    %x0 = affine.load %src[%wrappedToOne] : memref<?xi8>
+    %x1 = affine.load %src[%wrappedToOne + 1] : memref<?xi8>
+  }
+  return
+}
+
+// Multiplication can instead overflow an invariant coefficient while the
+// induction coefficient remains valid. Wrapping 2^64 to zero would erase the
+// runtime base and make these accesses look like a contiguous IV-only window.
+
+// CHECK-LABEL: func.func @overflowing_invariant_scale
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @overflowing_invariant_scale(%src: memref<?xi8>, %base: index) {
+  %large = affine.apply #times_2p32(%base)
+  %overflow = affine.apply #times_2p32(%large)
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i + symbol(%overflow)] : memref<?xi8>
+    %x1 = affine.load %src[%i + symbol(%overflow) + 1] : memref<?xi8>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @dynamic_trip
+// CHECK: affine.for %{{.*}} = 0 to %{{.*}} {
+func.func @dynamic_trip(%src: memref<?xi32>, %n: index) {
+  affine.for %i = 0 to %n {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// Division is outside the exact linear trip-count proof, even when these two
+// expressions happen to have a constant mathematical difference.
+
+// CHECK-LABEL: func.func @unsupported_bound_expression
+// CHECK: affine.for %{{.*}} = #{{.*}}(%{{.*}}) to #{{.*}}(%{{.*}}) {
+// CHECK-NOT: iter_args
+func.func @unsupported_bound_expression(%src: memref<?xi32>, %n: index) {
+  affine.for %i = #halved_lower(%n) to #halved_upper(%n) {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// Matching symbolic values are insufficient when their coefficients differ.
+// The span depends on the runtime symbol and may be zero.
+
+// CHECK-LABEL: func.func @bound_coefficient_mismatch
+// CHECK: affine.for %{{.*}} = %{{.*}} to #{{.*}}()[%{{.*}}] {
+// CHECK-NOT: iter_args
+func.func @bound_coefficient_mismatch(%src: memref<?xi32>, %n: index) {
+  affine.for %i = %n to #scaled_dynamic_upper()[%n] {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// Equal coefficients on different SSA symbols do not prove a constant span.
+
+// CHECK-LABEL: func.func @bound_symbol_mismatch
+// CHECK: affine.for %{{.*}} = %{{.*}} to #{{.*}}()[%{{.*}}] {
+// CHECK-NOT: iter_args
+func.func @bound_symbol_mismatch(%src: memref<?xi32>, %lower: index,
+                                 %upperBase: index) {
+  affine.for %i = %lower to #dynamic_upper()[%upperBase] {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// A negative symbolic span is a zero-trip loop. In particular, it must not be
+// interpreted as a large unsigned constant trip count.
+
+// CHECK-LABEL: func.func @negative_symbolic_trip
+// CHECK: affine.for %{{.*}} = %{{.*}} to #{{.*}}()[%{{.*}}] {
+func.func @negative_symbolic_trip(%src: memref<?xi32>, %n: index) {
+  affine.for %i = %n to #decreasing_upper()[%n] {
+    %x0 = affine.load %src[%i] : memref<?xi32>
+    %x1 = affine.load %src[%i + 1] : memref<?xi32>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @non_unit_step
+// CHECK: affine.for %{{.*}} = 0 to 8 step 2 {
+func.func @non_unit_step(%src: memref<10xi32>) {
+  affine.for %i = 0 to 8 step 2 {
+    %x0 = affine.load %src[%i] : memref<10xi32>
+    %x1 = affine.load %src[%i + 1] : memref<10xi32>
+  }
+  return
+}
+
+// Adjacent addresses in one iteration are not reused by the next iteration
+// when the induction-variable coefficient is two.
+
+// CHECK-LABEL: func.func @scaled_iv
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @scaled_iv(%src: memref<8xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[2 * %i] : memref<8xi32>
+    %x1 = affine.load %src[2 * %i + 1] : memref<8xi32>
+  }
+  return
+}
+
+// Reverse traversal overlaps in the opposite direction. Treating -1 as
+// forward unit stride would carry src[5] into iteration one, where x0 is
+// src[3].
+
+// CHECK-LABEL: func.func @reverse_unit_induction_is_not_forward_reuse
+// CHECK: %[[DISTINCT:.*]]:2 = memref.distinct_objects
+// CHECK-NEXT: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @reverse_unit_induction_is_not_forward_reuse(
+    %src0: memref<6xi32>, %dst0: memref<4xi32>) {
+  %src, %dst = memref.distinct_objects %src0, %dst0
+      : memref<6xi32>, memref<4xi32>
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[-%i + 4] : memref<6xi32>
+    %x1 = affine.load %src[-%i + 5] : memref<6xi32>
+    %sum = arith.addi %x0, %x1 : i32
+    affine.store %sum, %dst[%i] : memref<4xi32>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @duplicate_offset
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @duplicate_offset(%src: memref<5xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x0_again = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @non_contiguous_offsets
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @non_contiguous_offsets(%src: memref<6xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x2 = affine.load %src[%i + 2] : memref<6xi32>
+  }
+  return
+}
+
+// Modulo is outside the checked linear subset and must not be mistaken for a
+// contiguous sliding access.
+
+// CHECK-LABEL: func.func @nonlinear_access
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @nonlinear_access(%src: memref<8xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i mod 4] : memref<8xi32>
+    %x1 = affine.load %src[%i mod 4 + 1] : memref<8xi32>
+  }
+  return
+}
+
+// A write through a view of the source aliases the source and must block
+// moving its reads into the loop prologue.
+
+// CHECK-LABEL: func.func @cast_alias_write
+// CHECK: memref.cast
+// CHECK-NEXT: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @cast_alias_write(%src: memref<5xi32>) {
+  %alias = memref.cast %src : memref<5xi32> to memref<?xi32>
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    affine.store %x0, %alias[%i] : memref<?xi32>
+  }
+  return
+}
+
+// A subview is another distinct SSA value that still aliases the source.
+
+// CHECK-LABEL: func.func @subview_alias_write
+// CHECK: memref.subview
+// CHECK-NEXT: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NOT: iter_args
+func.func @subview_alias_write(%src: memref<5xi32>) {
+  %alias = memref.subview %src[0] [5] [1]
+      : memref<5xi32> to memref<5xi32, strided<[1]>>
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    affine.store %x0, %alias[%i] : memref<5xi32, strided<[1]>>
+  }
+  return
+}
+
+// A loop-carried memref can become an alias of the source through the
+// backedge, even when its initial value is a distinct object. Carrying x0
+// would cache the value loaded before the preceding iteration's store.
+
+// CHECK-LABEL: func.func @loop_carried_alias_write
+// CHECK: %[[DISTINCT:.*]]:2 = memref.distinct_objects
+// CHECK-NEXT: %{{.*}} = affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[ALIAS:.*]] = %[[DISTINCT]]#1)
+// CHECK-NEXT: %[[X0:.*]] = affine.load %[[DISTINCT]]#0[%[[I]]]
+// CHECK-NEXT: affine.load %[[DISTINCT]]#0[%[[I]] + 1]
+// CHECK-NEXT: affine.store %[[X0]], %[[ALIAS]][%[[I]] + 1]
+// CHECK-NEXT: affine.yield %[[DISTINCT]]#0
+func.func @loop_carried_alias_write(%src: memref<5xi32>,
+                                    %dst: memref<5xi32>) {
+  %src_distinct, %dst_distinct = memref.distinct_objects %src, %dst
+      : memref<5xi32>, memref<5xi32>
+  %unused = affine.for %i = 0 to 4
+      iter_args(%alias = %dst_distinct) -> (memref<5xi32>) {
+    %x0 = affine.load %src_distinct[%i] : memref<5xi32>
+    %x1 = affine.load %src_distinct[%i + 1] : memref<5xi32>
+    affine.store %x0, %alias[%i + 1] : memref<5xi32>
+    affine.yield %src_distinct : memref<5xi32>
+  }
+  return
+}
+
+// Bare function arguments may alias. Moving source reads ahead of this store
+// would therefore be unsafe.
+
+// CHECK-LABEL: func.func @may_alias_write
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @may_alias_write(%src: memref<5xi32>, %dst: memref<4xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    affine.store %x0, %dst[%i] : memref<4xi32>
+  }
+  return
+}
+
+// Calls with unknown effects may modify the source and must block reuse.
+
+// CHECK-LABEL: func.func @unknown_effect
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @unknown_effect(%src: memref<5xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    func.call @unknown(%src) : (memref<5xi32>) -> ()
+  }
+  return
+}
+
+// Memory effects nested under a recursively-effectful container are checked
+// individually. A nested source write must still block the preload.
+
+// CHECK-LABEL: func.func @nested_source_write
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @nested_source_write(%src: memref<5xi32>, %condition: i1) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    scf.if %condition {
+      affine.store %x0, %src[%i + 1] : memref<5xi32>
+    }
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @rank_two
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @rank_two(%src: memref<4x5xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i, 0] : memref<4x5xi32>
+    %x1 = affine.load %src[%i, 1] : memref<4x5xi32>
+  }
+  return
+}
+
+// A source created inside the loop cannot be preloaded before the loop.
+
+// CHECK-LABEL: func.func @source_defined_inside
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+// CHECK-NEXT: %[[LOCAL:.*]] = memref.alloca() : memref<5xi32>
+// CHECK-NEXT: affine.load %[[LOCAL]][%{{.*}}] : memref<5xi32>
+// CHECK-NEXT: affine.load %[[LOCAL]][%{{.*}} + 1] : memref<5xi32>
+func.func @source_defined_inside() {
+  affine.for %i = 0 to 4 {
+    %local = memref.alloca() : memref<5xi32>
+    %x0 = affine.load %local[%i] : memref<5xi32>
+    %x1 = affine.load %local[%i + 1] : memref<5xi32>
+  }
+  return
+}
+
+// CHECK-LABEL: func.func @writes_source
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @writes_source(%src: memref<5xi32>) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    affine.store %x0, %src[%i + 1] : memref<5xi32>
+  }
+  return
+}

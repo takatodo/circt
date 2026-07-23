@@ -168,6 +168,25 @@ def MemoryBanking : Pass<"memory-banking", "::mlir::func::FuncOp"> {
   let dependentDialects = ["mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::affine::AffineDialect"];
 }
 
+def AffineSlidingWindowReuse :
+    Pass<"affine-sliding-window-reuse", "::mlir::func::FuncOp"> {
+  let summary = "Reuse overlapping rank-one affine loads across loop iterations";
+  let description = [{
+    Rewrites a unit-step affine loop containing direct affine.load operations
+    that form one or more contiguous sliding windows over rank-one memrefs. The
+    pass preloads all but the final element needed by each window's first
+    iteration and carries those element values through affine.for iter_args,
+    leaving one load per window and iteration in the loop body.
+
+    This reduces the steady-state memory-read demand of HLS pipelines.
+
+    The transformation is deliberately conservative. It requires a provably
+    constant trip count greater than one and rejects loops that may write to
+    the source memref.
+  }];
+  let dependentDialects = ["mlir::affine::AffineDialect"];
+}
+
 def IndexSwitchToIf : Pass<"switch-to-if", "::mlir::ModuleOp"> {
   let summary = "Index switch to if";
   let description = [{
