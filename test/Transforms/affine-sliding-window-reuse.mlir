@@ -83,6 +83,10 @@ func.func @existing_iter_args_and_multiple_uses(%src: memref<5xi32>) -> i32 {
 #dynamic_upper = affine_map<()[s0] -> (s0 + 4)>
 #decreasing_upper = affine_map<()[s0] -> (s0 - 1)>
 #plus_one = affine_map<(d0) -> (d0 + 1)>
+#identity_bound = affine_map<(d0) -> (d0)>
+#partly_empty_upper = affine_map<() -> (4, -1)>
+#times_large = affine_map<(d0) -> (d0 * 4611686018427387904)>
+#times_four = affine_map<(d0) -> (d0 * 4)>
 
 func.func private @unknown(memref<5xi32>)
 
@@ -241,6 +245,27 @@ func.func @nested_loop(%src: memref<5xi32>) {
   return
 }
 
+// A recursively-effectful container does not block reuse when its nested
+// operations only read memory.
+
+// CHECK-LABEL: func.func @nested_read_only
+// CHECK: %[[PRELOAD:.*]] = affine.load %[[SRC:.*]][0] : memref<6xi32>
+// CHECK: affine.for %[[I:.*]] = 0 to 4
+// CHECK-SAME: iter_args(%[[STATE:.*]] = %[[PRELOAD]])
+// CHECK: scf.if
+// CHECK: affine.load %[[SRC]][%[[I]] + 2] : memref<6xi32>
+// CHECK: affine.yield %{{.*}} : i32
+func.func @nested_read_only(%src: memref<6xi32>, %condition: i1) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<6xi32>
+    %x1 = affine.load %src[%i + 1] : memref<6xi32>
+    scf.if %condition {
+      %nested = affine.load %src[%i + 2] : memref<6xi32>
+    }
+  }
+  return
+}
+
 // Independent windows on different sources are both reused. The pass
 // restarts its walk after rebuilding a loop, so neither source is skipped.
 
@@ -286,6 +311,81 @@ func.func @zero_trip(%src: memref<8xi32>) {
   affine.for %i = 4 to 4 {
     %x0 = affine.load %src[%i] : memref<8xi32>
     %x1 = affine.load %src[%i + 1] : memref<8xi32>
+  }
+  return
+}
+
+// An affine.for upper bound is the minimum of all map results. Every result
+// must therefore describe a positive span before preloading is safe.
+
+// CHECK-LABEL: func.func @empty_multiple_upper_bounds
+// CHECK-NEXT: affine.for %{{.*}} = 0 to min #{{.*}}() {
+func.func @empty_multiple_upper_bounds(%src: memref<8xi32>) {
+  affine.for %i = 0 to min #partly_empty_upper() {
+    %x0 = affine.load %src[%i] : memref<8xi32>
+    %x1 = affine.load %src[%i + 1] : memref<8xi32>
+  }
+  return
+}
+
+// Computing this trip count in signed i64 overflows. Mathematically the loop
+// is empty and must not gain an unconditional preload.
+
+// CHECK-LABEL: func.func @overflowing_zero_trip
+// CHECK-NEXT: affine.for %{{.*}} = 9223372036854775806 to -9223372036854775807 {
+func.func @overflowing_zero_trip(%src: memref<1xi32>) {
+  affine.for %i = 9223372036854775806 to -9223372036854775807 {
+    %x0 = affine.load %src[%i] : memref<1xi32>
+    %x1 = affine.load %src[%i + 1] : memref<1xi32>
+  }
+  return
+}
+
+// The same overflow can be hidden behind constant SSA operands and
+// affine.apply chains.
+
+// CHECK-LABEL: func.func @ssa_overflowing_zero_trip
+// CHECK: %[[LB0:.*]] = arith.constant 9223372036854775806 : index
+// CHECK-NEXT: %[[UB0:.*]] = arith.constant -9223372036854775807 : index
+// CHECK-NEXT: %[[LB:.*]] = affine.apply #{{.*}}(%[[LB0]])
+// CHECK-NEXT: %[[UB:.*]] = affine.apply #{{.*}}(%[[UB0]])
+// CHECK-NEXT: affine.for %{{.*}} = %[[LB]] to %[[UB]] {
+func.func @ssa_overflowing_zero_trip(%src: memref<1xi32>) {
+  %lb0 = arith.constant 9223372036854775806 : index
+  %ub0 = arith.constant -9223372036854775807 : index
+  %lb = affine.apply #identity_bound(%lb0)
+  %ub = affine.apply #identity_bound(%ub0)
+  affine.for %i = %lb to %ub {
+    %x0 = affine.load %src[%i] : memref<1xi32>
+    %x1 = affine.load %src[%i + 1] : memref<1xi32>
+  }
+  return
+}
+
+// Expanding access-minus-IV must also fail closed on signed overflow.
+
+// CHECK-LABEL: func.func @overflowing_access_offset
+// CHECK: %[[N:.*]] = arith.constant -9223372036854775807 : index
+// CHECK-NEXT: affine.for %{{.*}} = -9223372036854775807 to -9223372036854775805 {
+func.func @overflowing_access_offset(%src: memref<4xi8>) {
+  %n = arith.constant -9223372036854775807 : index
+  affine.for %i = -9223372036854775807 to -9223372036854775805 {
+    %x0 = affine.load %src[%i - symbol(%n) + 1] : memref<4xi8>
+    %x1 = affine.load %src[%i - symbol(%n) + 2] : memref<4xi8>
+  }
+  return
+}
+
+// Multiplication can overflow only after composing otherwise valid maps.
+
+// CHECK-LABEL: func.func @overflowing_composed_scale
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @overflowing_composed_scale(%src: memref<?xi8>) {
+  affine.for %i = 0 to 4 {
+    %large = affine.apply #times_large(%i)
+    %overflow = affine.apply #times_four(%large)
+    %x0 = affine.load %src[%overflow] : memref<?xi8>
+    %x1 = affine.load %src[%overflow + 1] : memref<?xi8>
   }
   return
 }
@@ -367,6 +467,22 @@ func.func @unknown_effect(%src: memref<5xi32>) {
     %x0 = affine.load %src[%i] : memref<5xi32>
     %x1 = affine.load %src[%i + 1] : memref<5xi32>
     func.call @unknown(%src) : (memref<5xi32>) -> ()
+  }
+  return
+}
+
+// Memory effects nested under a recursively-effectful container are checked
+// individually. A nested source write must still block the preload.
+
+// CHECK-LABEL: func.func @nested_source_write
+// CHECK: affine.for %{{.*}} = 0 to 4 {
+func.func @nested_source_write(%src: memref<5xi32>, %condition: i1) {
+  affine.for %i = 0 to 4 {
+    %x0 = affine.load %src[%i] : memref<5xi32>
+    %x1 = affine.load %src[%i + 1] : memref<5xi32>
+    scf.if %condition {
+      affine.store %x0, %src[%i + 1] : memref<5xi32>
+    }
   }
   return
 }

@@ -6,11 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "AffineSlidingReuseSupport.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Analysis/AliasAnalysis.h"
-#include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/MapVector.h"
@@ -25,6 +24,10 @@ namespace circt {
 
 using namespace mlir;
 using namespace mlir::affine;
+using circt::affine_reuse_detail::CheckedLinearExpr;
+using circt::affine_reuse_detail::CheckedLinearExprExpander;
+using circt::affine_reuse_detail::findModifyingOperation;
+using circt::affine_reuse_detail::getExactPositiveTripCount;
 
 namespace {
 
@@ -39,37 +42,30 @@ struct SlidingWindow {
 };
 
 /// Return the constant difference between an affine load's rank-one access and
-/// the loop induction variable. Full affine composition makes this recognize
-/// equivalent accesses expressed through affine.apply operations as well.
-static std::optional<int64_t> getConstantOffset(AffineLoadOp load,
-                                                AffineForOp loop) {
+/// the loop induction variable. Checked composition recognizes equivalent
+/// affine.apply chains without overflowing or unbounded recursion.
+static std::optional<int64_t>
+getConstantOffset(AffineLoadOp load, AffineForOp loop,
+                  CheckedLinearExprExpander &accessExpander) {
   auto memrefType = dyn_cast<MemRefType>(load.getMemRef().getType());
   if (!memrefType || memrefType.getRank() != 1 ||
       load.getAffineMap().getNumResults() != 1)
     return std::nullopt;
 
-  AffineValueMap access(load.getAffineMap(), load.getMapOperands());
-  auto ivMap = AffineMap::get(1, 0, getAffineDimExpr(0, loop.getContext()));
-  AffineValueMap inductionVariable(ivMap, ValueRange{loop.getInductionVar()});
-  AffineValueMap difference;
-  AffineValueMap::difference(access, inductionVariable, &difference);
-
-  auto constant = dyn_cast<AffineConstantExpr>(difference.getResult(0));
-  if (!constant)
+  std::optional<CheckedLinearExpr> access = accessExpander.expand(
+      load.getAffineMap().getResult(0), load.getMapOperands(),
+      load.getAffineMap().getNumDims());
+  if (!access || access->inductionCoefficient != 1 ||
+      !access->invariantCoefficients.empty())
     return std::nullopt;
-  return constant.getValue();
+  return access->constant;
 }
 
 /// Return true if an operation in the loop may modify the source. Unknown
 /// effects intentionally block the transformation.
 static bool mayModifySource(AffineForOp loop, Value source,
                             AliasAnalysis &aliasAnalysis) {
-  WalkResult result = loop.getBody()->walk([&](Operation *operation) {
-    if (aliasAnalysis.getModRef(operation, source).isMod())
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-  return result.wasInterrupted();
+  return findModifyingOperation(loop, source, aliasAnalysis) != nullptr;
 }
 
 /// Return true only when every candidate trip-count expression is a signed
@@ -77,16 +73,8 @@ static bool mayModifySource(AffineForOp loop, Value source,
 /// Checking the expressions directly also avoids turning a negative symbolic
 /// span into a large uint64_t trip count.
 static bool hasProfitableConstantTripCount(AffineForOp loop) {
-  AffineMap tripCountMap;
-  SmallVector<Value> tripCountOperands;
-  getTripCountMapAndOperands(loop, &tripCountMap, &tripCountOperands);
-  if (!tripCountMap)
-    return false;
-
-  return llvm::all_of(tripCountMap.getResults(), [](AffineExpr expression) {
-    auto constant = dyn_cast<AffineConstantExpr>(expression);
-    return constant && constant.getValue() > 1;
-  });
+  std::optional<uint64_t> tripCount = getExactPositiveTripCount(loop);
+  return tripCount && *tripCount > 1;
 }
 
 /// Find one duplicate-free contiguous window. Gaps between recognized offsets
@@ -101,12 +89,14 @@ findSlidingWindow(AffineForOp loop, AliasAnalysis &aliasAnalysis) {
   if (!hasProfitableConstantTripCount(loop))
     return std::nullopt;
 
+  CheckedLinearExprExpander accessExpander(loop.getInductionVar());
   llvm::MapVector<Value, SmallVector<LoadAtOffset>> loadsBySource;
   for (Operation &operation : loop.getBody()->without_terminator()) {
     auto load = dyn_cast<AffineLoadOp>(operation);
     if (!load)
       continue;
-    std::optional<int64_t> offset = getConstantOffset(load, loop);
+    std::optional<int64_t> offset =
+        getConstantOffset(load, loop, accessExpander);
     if (!offset)
       continue;
     loadsBySource[load.getMemRef()].push_back({load, *offset});
