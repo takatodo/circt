@@ -1,4 +1,6 @@
 add_circt_library(CIRCTTransforms
+  AffineSlidingReuseAnalysis.cpp
+  AffineSlidingWindowReuse.cpp
   CellIFT.cpp
   FlattenMemRefs.cpp
   HierarchicalRunner.cpp
@@ -24,6 +26,7 @@ add_circt_library(CIRCTTransforms
   MLIRControlFlowTransforms
   MLIRFuncDialect
   MLIRIR
+  MLIRAnalysis
   MLIRMemRefDialect
   MLIRSupport
   MLIRTransforms
