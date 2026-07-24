@@ -13,6 +13,7 @@
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Scheduling/Problems.h"
+#include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -25,6 +26,11 @@
 using namespace mlir;
 using namespace mlir::affine;
 using namespace circt::scheduling;
+
+static bool isKnownReadOnlyMemoryOp(Operation *op) {
+  return isa<AffineReadOpInterface, memref::LoadOp>(op) &&
+         !isa<AffineWriteOpInterface, memref::StoreOp>(op);
+}
 
 /// CyclicSchedulingAnalysis constructs a CyclicProblem for each AffineForOp by
 /// performing a memory dependence analysis and inserting dependences into the
@@ -51,15 +57,23 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
   CyclicProblem problem(forOp);
 
   // Insert memory dependences into the problem.
-  forOp.getBody()->walk([&](Operation *op) {
+  WalkResult memoryWalkResult = forOp.getBody()->walk([&](Operation *op) {
     // Insert every operation into the problem.
     problem.insertOperation(op);
 
     ArrayRef<MemoryDependence> dependences = memoryAnalysis.getDependences(op);
     if (dependences.empty())
-      return;
+      return WalkResult::advance();
 
     for (MemoryDependence memoryDep : dependences) {
+      if (memoryDep.dependenceType == DependenceResult::Failure) {
+        // An unresolved read/read pair does not constrain memory ordering.
+        if (!isKnownReadOnlyMemoryOp(memoryDep.source) ||
+            !isKnownReadOnlyMemoryOp(op))
+          return WalkResult::interrupt();
+        continue;
+      }
+
       // Don't insert a dependence into the problem if there is no dependence.
       if (!hasDependence(memoryDep.dependenceType))
         continue;
@@ -78,7 +92,11 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
       if (distance > 0)
         problem.setDistance(dep, distance);
     }
+
+    return WalkResult::advance();
   });
+  if (memoryWalkResult.wasInterrupted())
+    return;
 
   // Insert conditional dependences into the problem.
   forOp.getBody()->walk([&](Operation *op) {
@@ -154,9 +172,10 @@ void circt::analysis::CyclicSchedulingAnalysis::analyzeForOp(
   problems.insert(std::pair<Operation *, CyclicProblem>(forOp, problem));
 }
 
-CyclicProblem &
+FailureOr<CyclicProblem *>
 circt::analysis::CyclicSchedulingAnalysis::getProblem(AffineForOp forOp) {
   auto problem = problems.find(forOp);
-  assert(problem != problems.end() && "expected problem to exist");
-  return problem->second;
+  if (problem == problems.end())
+    return failure();
+  return &problem->second;
 }
