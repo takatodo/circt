@@ -35,7 +35,9 @@ namespace analysis {
 struct CyclicSchedulingAnalysis {
   CyclicSchedulingAnalysis(Operation *funcOp, mlir::AnalysisManager &am);
 
-  scheduling::CyclicProblem &getProblem(mlir::affine::AffineForOp forOp);
+  /// Return failure if no scheduling problem was constructed for the loop.
+  FailureOr<scheduling::CyclicProblem *>
+  getProblem(mlir::affine::AffineForOp forOp);
 
 private:
   void analyzeForOp(mlir::affine::AffineForOp forOp,

@@ -157,9 +157,13 @@ void TestSchedulingAnalysisPass::runOnOperation() {
   getOperation().walk([&](AffineForOp forOp) {
     if (isa<AffineForOp>(forOp.getBody()->front()))
       return;
-    CyclicProblem problem = analysis.getProblem(forOp);
+    auto problem = analysis.getProblem(forOp);
+    if (failed(problem)) {
+      forOp->setAttr("scheduling_analysis_failed", UnitAttr::get(context));
+      return;
+    }
     forOp.getBody()->walk([&](Operation *op) {
-      for (auto dep : problem.getDependences(op)) {
+      for (auto dep : (*problem)->getDependences(op)) {
         assert(!dep.isInvalid());
         if (dep.isAuxiliary())
           op->setAttr("dependence", UnitAttr::get(context));

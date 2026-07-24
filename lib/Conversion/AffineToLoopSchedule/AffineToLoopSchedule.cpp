@@ -130,8 +130,15 @@ void AffineToLoopSchedule::runOnOperation() {
     if (nestedLoops.size() != 1)
       continue;
 
-    ModuloProblem moduloProblem =
-        getModuloProblem(schedulingAnalysis->getProblem(nestedLoops.back()));
+    auto cyclicProblem = schedulingAnalysis->getProblem(nestedLoops.back());
+    if (failed(cyclicProblem)) {
+      nestedLoops.back().emitError(
+          "failed to construct a cyclic scheduling problem due to an "
+          "unresolved affine memory dependence");
+      return signalPassFailure();
+    }
+
+    ModuloProblem moduloProblem = getModuloProblem(**cyclicProblem);
 
     // Populate the target operator types.
     if (failed(populateOperatorTypes(nestedLoops, moduloProblem)))
