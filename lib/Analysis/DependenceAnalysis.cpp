@@ -153,17 +153,31 @@ circt::analysis::MemoryDependenceAnalysis::MemoryDependenceAnalysis(
 /// Returns the dependences, if any, that the given Operation depends on.
 ArrayRef<MemoryDependence>
 circt::analysis::MemoryDependenceAnalysis::getDependences(Operation *op) {
-  return results[op];
+  auto it = results.find(op);
+  if (it == results.end())
+    return {};
+  return it->second;
 }
 
 /// Replaces the dependences, if any, from the oldOp to the newOp.
 void circt::analysis::MemoryDependenceAnalysis::replaceOp(Operation *oldOp,
                                                           Operation *newOp) {
+  if (oldOp == newOp)
+    return;
+
+  assert(!results.contains(newOp) &&
+         "replacement operation already has dependence results");
+
   // If oldOp had any dependences.
   auto it = results.find(oldOp);
-  if (it != results.end())
+  if (it != results.end()) {
     // Move the dependences to newOp.
-    it->first = newOp;
+    auto dependences = std::move(it->second);
+    results.erase(it);
+    bool inserted = results.try_emplace(newOp, std::move(dependences)).second;
+    assert(inserted && "failed to insert replacement operation");
+    (void)inserted;
+  }
 
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.

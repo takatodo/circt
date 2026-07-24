@@ -175,3 +175,16 @@ func.func @test9(%arg0: memref<?xi32>, %arg1 : memref<?xi32>, %arg2 : memref<?xi
   }
   return
 }
+
+// CHECK-LABEL: func @test_replace_op
+func.func @test_replace_op(%arg0: memref<8xi32>) attributes {test.replace_dependence_ops} {
+  affine.for %arg1 = 1 to 8 {
+    // CHECK: affine.load %arg0[%arg1] {dependence_source, dependences = []}
+    // CHECK-NEXT: affine.load %arg0[%arg1]
+    %0 = affine.load %arg0[%arg1] : memref<8xi32>
+    // CHECK{LITERAL}: affine.load %arg0[%arg1 - 1] {dependences = [[[1, 1]]]}
+    // CHECK-NEXT: affine.load %arg0[%arg1 - 1]
+    %1 = affine.load %arg0[%arg1 - 1] : memref<8xi32>
+  }
+  return
+}

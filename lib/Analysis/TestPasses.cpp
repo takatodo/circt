@@ -84,15 +84,34 @@ void TestDependenceAnalysisPass::runOnOperation() {
 
   MemoryDependenceAnalysis analysis(getOperation());
 
+  SmallVector<Operation *> memoryOps;
   getOperation().walk([&](Operation *op) {
-    if (!isa<AffineReadOpInterface, AffineWriteOpInterface>(op))
-      return;
+    if (isa<AffineReadOpInterface, AffineWriteOpInterface>(op))
+      memoryOps.push_back(op);
+  });
 
+  bool replaceDependenceOps =
+      getOperation()->hasAttr("test.replace_dependence_ops");
+  if (replaceDependenceOps) {
+    for (Operation *&op : memoryOps) {
+      OpBuilder builder(op);
+      Operation *replacement = builder.clone(*op);
+      // Querying an untracked operation must not affect later replacement.
+      (void)analysis.getDependences(replacement);
+      analysis.replaceOp(op, replacement);
+      op = replacement;
+    }
+  }
+
+  for (Operation *op : memoryOps) {
     SmallVector<Attribute> deps;
 
     for (auto dep : analysis.getDependences(op)) {
       if (dep.dependenceType != DependenceResult::HasDependence)
         continue;
+
+      if (replaceDependenceOps)
+        dep.source->setAttr("dependence_source", UnitAttr::get(context));
 
       SmallVector<Attribute> comps;
       for (auto comp : dep.dependenceComponents) {
@@ -109,7 +128,7 @@ void TestDependenceAnalysisPass::runOnOperation() {
 
     auto dependences = ArrayAttr::get(context, deps);
     op->setAttr("dependences", dependences);
-  });
+  }
 }
 
 //===----------------------------------------------------------------------===//
