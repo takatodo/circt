@@ -553,6 +553,18 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     }
   }
 
+  // A pipeline terminator may only use stage results as iteration arguments or
+  // pipeline results. Materialize affine loop iteration arguments that are
+  // forwarded directly to the yield as results of the first stage.
+  for (Value value : forOp.getBody()->getTerminator()->getOperands()) {
+    if (!llvm::is_contained(forOp.getRegionIterArgs(), value))
+      continue;
+    if (registerValues.empty())
+      registerValues.emplace_back();
+    if (!llvm::is_contained(registerValues.front(), value))
+      registerValues.front().push_back(value);
+  }
+
   // Now make register Types and stageValueMaps
   for (unsigned i = 0; i < registerValues.size(); ++i) {
     SmallVector<mlir::Type> types;
@@ -602,17 +614,25 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     unsigned resIndex = 0;
     for (auto res : registerValues[startTime]) {
       stageOperands.push_back(stageValueMaps[startTime].lookup(res));
+
       // Additionally, update the map of the stage that will consume the
       // registered value
+      Value stageResult = stage.getResult(resIndex++);
+      if (llvm::is_contained(forOp.getRegionIterArgs(), res)) {
+        for (unsigned i = startTime + 1; i < stageValueMaps.size(); ++i)
+          stageValueMaps[i].map(res, stageResult);
+        continue;
+      }
+
+      Operation *definingOp = res.getDefiningOp();
       unsigned destTime = startTime + 1;
-      unsigned latency = *problem.getLatency(
-          *problem.getLinkedOperatorType(res.getDefiningOp()));
+      unsigned latency =
+          *problem.getLatency(*problem.getLinkedOperatorType(definingOp));
       // Multi-cycle case
-      if (*problem.getStartTime(res.getDefiningOp()) == startTime &&
-          latency > 1)
+      if (*problem.getStartTime(definingOp) == startTime && latency > 1)
         destTime = startTime + latency;
       destTime = std::min((unsigned)(stageValueMaps.size() - 1), destTime);
-      stageValueMaps[destTime].map(res, stage.getResult(resIndex++));
+      stageValueMaps[destTime].map(res, stageResult);
     }
     // Add these mapped values to pipeline.register
     stageTerminator->insertOperands(stageTerminator->getNumOperands(),
@@ -639,8 +659,10 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
       stagesBlock.front().getResult(stagesBlock.front().getNumResults() - 1));
 
   for (auto value : forOp.getBody()->getTerminator()->getOperands()) {
-    unsigned lookupTime = std::min((unsigned)(stageValueMaps.size() - 1),
-                                   pipeTimes[value.getDefiningOp()].second);
+    Operation *definingOp = value.getDefiningOp();
+    unsigned lookupTime = llvm::is_contained(forOp.getRegionIterArgs(), value)
+                              ? stageValueMaps.size() - 1
+                              : pipeTimes.lookup(definingOp).second;
 
     termIterArgs.push_back(stageValueMaps[lookupTime].lookup(value));
     termResults.push_back(stageValueMaps[lookupTime].lookup(value));
