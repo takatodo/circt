@@ -3,6 +3,7 @@ set(LLVM_OPTIONAL_SOURCES
   ChainingSupport.cpp
   CPSATSchedulers.cpp
   LPSchedulers.cpp
+  NodeRLScheduler.cpp
   Problems.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
@@ -11,6 +12,7 @@ set(LLVM_OPTIONAL_SOURCES
 set(SCHEDULING_SOURCES
   ASAPScheduler.cpp
   ChainingSupport.cpp
+  NodeRLScheduler.cpp
   Problems.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
@@ -33,3 +35,11 @@ add_circt_library(CIRCTScheduling
   LINK_LIBS PUBLIC
   ${SCHEDULING_LIBS}
   )
+
+# add_circt_library builds sources through an object library. Link OR-Tools to
+# that target as well so its public compile definitions (notably
+# OR_PROTO_DLL=) reach the generated protobuf headers.
+if(ortools_FOUND)
+  target_link_libraries(obj.CIRCTScheduling PRIVATE ortools::ortools)
+  target_compile_definitions(obj.CIRCTScheduling PRIVATE SCHEDULING_OR_TOOLS)
+endif()

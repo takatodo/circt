@@ -30,6 +30,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -55,6 +56,100 @@ using namespace circt::scheduling;
 using namespace circt::loopschedule;
 
 namespace {
+
+static constexpr StringLiteral resourceBindingsAttrName =
+    "circt.resource_bindings";
+static constexpr StringLiteral rotatingReservationsAttrName =
+    "circt.rotating_resource_reservations";
+
+/// Build a periodic instance-selection table for one resource. The table is
+/// represented by one color per operation and iteration class. It is only
+/// applicable when every use of the resource is rotating; mixing this scheme
+/// with pre-existing static bindings needs a combined allocator.
+struct RotatingSelectorAllocation {
+  DenseMap<Operation *, SmallVector<unsigned>> selectors;
+  unsigned instances = 0;
+};
+
+static std::optional<RotatingSelectorAllocation>
+buildRotatingSelectorTable(ModuloProblem &problem,
+                           Problem::ResourceType resource) {
+  unsigned instanceLimit = problem.getLimit(resource).value_or(0);
+  unsigned period = *problem.getInitiationInterval();
+  unsigned hold = problem.getResourceInitiationInterval(resource).value_or(1);
+  if (instanceLimit == 0 || hold <= period)
+    return std::nullopt;
+
+  SmallVector<Operation *> users;
+  for (auto *op : problem.getOperations()) {
+    auto resources = problem.getLinkedResourceTypes(op);
+    if (resources && llvm::is_contained(*resources, resource)) {
+      if (problem.getResourceBindings(op))
+        return std::nullopt;
+      users.push_back(op);
+    }
+  }
+  if (users.empty())
+    return std::nullopt;
+
+  llvm::sort(users, [&](Operation *lhs, Operation *rhs) {
+    return std::make_tuple(*problem.getStartTime(lhs) % period, lhs) <
+           std::make_tuple(*problem.getStartTime(rhs) % period, rhs);
+  });
+
+  // Find the shortest repeating selector table. The number of available
+  // instances is an upper bound, not a reason to lengthen the selector or
+  // materialize unused cells. Trying all periods through the instance limit
+  // includes the previous fixed-period construction while preferring smaller
+  // hardware/control realizations.
+  for (unsigned selectorPeriod = 1; selectorPeriod <= instanceLimit;
+       ++selectorPeriod) {
+    uint64_t horizon64 = uint64_t(period) * selectorPeriod;
+    if (horizon64 == 0 || horizon64 > 4096)
+      break;
+    // A request would overlap the next repetition of itself.
+    if (hold > horizon64)
+      continue;
+    unsigned horizon = horizon64;
+    SmallVector<SmallVector<bool>> occupied(instanceLimit,
+                                            SmallVector<bool>(horizon, false));
+    DenseMap<Operation *, SmallVector<unsigned>> table;
+    unsigned usedInstances = 0;
+    bool failed = false;
+    for (auto *op : users) {
+      auto &selectors = table[op];
+      for (unsigned iterationClass = 0; iterationClass != selectorPeriod;
+           ++iterationClass) {
+        unsigned start =
+            (*problem.getStartTime(op) % period) + iterationClass * period;
+        unsigned instance = 0;
+        for (; instance != instanceLimit; ++instance) {
+          bool available = true;
+          for (unsigned offset = 0; offset != hold; ++offset)
+            if (occupied[instance][(start + offset) % horizon]) {
+              available = false;
+              break;
+            }
+          if (available)
+            break;
+        }
+        if (instance == instanceLimit) {
+          failed = true;
+          break;
+        }
+        for (unsigned offset = 0; offset != hold; ++offset)
+          occupied[instance][(start + offset) % horizon] = true;
+        selectors.push_back(instance);
+        usedInstances = std::max(usedInstances, instance + 1);
+      }
+      if (failed)
+        break;
+    }
+    if (!failed)
+      return RotatingSelectorAllocation{std::move(table), usedInstances};
+  }
+  return std::nullopt;
+}
 
 struct AffineToLoopSchedule
     : public circt::impl::AffineToLoopScheduleBase<AffineToLoopSchedule> {
@@ -359,6 +454,13 @@ LogicalResult AffineToLoopSchedule::populateOperatorTypes(
         .Case<MulIOp>([&](Operation *mcOp) {
           // Some known multi-cycle ops.
           problem.setLinkedOperatorType(mcOp, mcOpr);
+          if (multiplierLimit != 0) {
+            auto mulRsrc = problem.getOrInsertResourceType("multiplier");
+            problem.setLimit(mulRsrc, multiplierLimit);
+            problem.setResourceInitiationInterval(mulRsrc, multiplierII);
+            problem.setLinkedResourceTypes(
+                mcOp, SmallVector<Problem::ResourceType>{mulRsrc});
+          }
           return WalkResult::advance();
         })
         .Default([&](Operation *badOp) {
@@ -397,8 +499,33 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
     return failure();
 
   auto *anchor = forOp.getBody()->getTerminator();
-  if (failed(scheduleSimplex(problem, anchor)))
-    return failure();
+  if (scheduler == "simplex") {
+    if (failed(scheduleSimplex(problem, anchor)))
+      return failure();
+  } else if (scheduler == "node-rl") {
+    NodeRLSchedulerOptions options;
+    options.episodes = nodeRLEpisodes;
+    options.episodeNodeBudget = nodeRLEpisodeNodeBudget;
+    options.resourceOrderingBudget = nodeRLResourceOrderingBudget;
+    options.localSearchNodes = nodeRLLocalSearchNodes;
+    options.localSearchTimeLimitSeconds = nodeRLLocalSearchTimeLimit;
+    options.seed = nodeRLSeed;
+    if (failed(scheduleNodeRL(problem, anchor, options)))
+      return failure();
+#ifdef SCHEDULING_OR_TOOLS
+  } else if (scheduler == "cpsat") {
+    if (failed(scheduleCPSAT(problem, anchor)))
+      return failure();
+#endif
+  } else {
+    return forOp.emitError() << "unsupported modulo scheduler '" << scheduler
+                             << "'; expected 'simplex', 'node-rl'"
+#ifdef SCHEDULING_OR_TOOLS
+                             << ", or 'cpsat'";
+#else
+                             << " (or 'cpsat' in an OR-Tools build)";
+#endif
+  }
 
   // Verify the solution.
   if (failed(problem.verify()))
@@ -472,6 +599,24 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     startGroups[*startTime].push_back(op);
   }
 
+  // Compute each cyclic selector table once. Besides avoiding repeated graph
+  // coloring for every operation, this also distinguishes a real rotating
+  // allocation from the ordinary "no static binding metadata" case.
+  DenseMap<Problem::ResourceType, RotatingSelectorAllocation>
+      rotatingSelectorTables;
+  DenseSet<Problem::ResourceType> visitedResources;
+  for (auto *op : problem.getOperations()) {
+    auto resources = problem.getLinkedResourceTypes(op);
+    if (!resources)
+      continue;
+    for (auto resource : *resources) {
+      if (!visitedResources.insert(resource).second)
+        continue;
+      if (auto table = buildRotatingSelectorTable(problem, resource))
+        rotatingSelectorTables.try_emplace(resource, std::move(*table));
+    }
+  }
+
   // Maintain mappings of values in the loop body and results of stages,
   // initially populated with the iter args.
   IRMapping valueMap;
@@ -485,11 +630,12 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   Block &stagesBlock = pipeline.getStagesBlock();
   builder.setInsertionPointToStart(&stagesBlock);
 
-  // Iterate in order of the start times.
-  SmallVector<unsigned> startTimes;
+  // Start with the operation-bearing stages. Forwarding-only stages are added
+  // below once the required register lifetimes are known.
+  SmallVector<unsigned> operationStartTimes;
   for (const auto &group : startGroups)
-    startTimes.push_back(group.first);
-  llvm::sort(startTimes);
+    operationStartTimes.push_back(group.first);
+  llvm::sort(operationStartTimes);
 
   DominanceInfo dom(getOperation());
 
@@ -503,7 +649,7 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   // For storing the range of stages an operation's results need to be valid for
   DenseMap<Operation *, std::pair<unsigned, unsigned>> pipeTimes;
 
-  for (auto startTime : startTimes) {
+  for (auto startTime : operationStartTimes) {
     auto group = startGroups[startTime];
 
     // Collect the return types for this stage. Operations whose results are not
@@ -566,11 +712,37 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   // One more map is needed for the pipeline stages terminator
   stageValueMaps.push_back(valueMap);
 
+  // A value with a multi-cycle lifetime must pass through every physical
+  // pipeline stage, including stages that contain no scheduled operation. If
+  // these forwarding stages are omitted, the value map for the later consumer
+  // remains empty (for example, the intermediate product in a 2MM kernel).
+  SmallVector<unsigned> startTimes = operationStartTimes;
+  for (auto [time, values] : llvm::enumerate(registerValues))
+    if (!values.empty() && !llvm::is_contained(startTimes, time))
+      startTimes.push_back(time);
+  llvm::sort(startTimes);
+
   // Create stages along with maps
   for (auto startTime : startTimes) {
     auto group = startGroups[startTime];
     llvm::sort(group, [&](Operation *a, Operation *b) {
-      return dom.properlyDominates(a, b);
+      if (a == b)
+        return false;
+      // Values defined and used in the same stage must be cloned in def-use
+      // order. Dominance alone is not a strict ordering for sibling
+      // operations, which made an affine 2MM inner loop occasionally clone a
+      // consumer before its producer and leave a null mapped operand.
+      if (llvm::is_contained(a->getUsers(), b))
+        return true;
+      if (llvm::is_contained(b->getUsers(), a))
+        return false;
+      if (dom.properlyDominates(a, b))
+        return true;
+      if (dom.properlyDominates(b, a))
+        return false;
+      if (a->getBlock() == b->getBlock())
+        return a->isBeforeInBlock(b);
+      return a < b;
     });
     auto stageTypes = registerTypes[startTime];
     // Add the induction variable increment in the first stage.
@@ -589,6 +761,80 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
 
     for (auto *op : group) {
       auto *newOp = builder.clone(*op, stageValueMaps[startTime]);
+
+      // Preserve the resource-to-instance assignment as target-neutral
+      // metadata. A downstream implementation lowering can use it to share a
+      // physical operator cell across mutually exclusive operations.
+      if (auto bindings = problem.getResourceBindings(op)) {
+        SmallVector<Attribute> bindingAttrs;
+        SmallVector<Problem::ResourceType> limitedResources;
+        if (auto resources = problem.getLinkedResourceTypes(op))
+          for (auto resource : *resources)
+            if (problem.getLimit(resource).value_or(0) > 0 &&
+                !llvm::is_contained(limitedResources, resource))
+              limitedResources.push_back(resource);
+        for (auto [index, resource] : llvm::enumerate(limitedResources)) {
+          assert(index < bindings->size() && "missing resource binding");
+          bindingAttrs.push_back(DictionaryAttr::get(
+              builder.getContext(),
+              {NamedAttribute(builder.getStringAttr("resource"),
+                              builder.getStringAttr(resource.getValue())),
+               NamedAttribute(builder.getStringAttr("instance"),
+                              builder.getI64IntegerAttr((*bindings)[index])),
+               NamedAttribute(
+                   builder.getStringAttr("hold"),
+                   builder.getI64IntegerAttr(
+                       problem.getResourceInitiationInterval(resource).value_or(
+                           1))),
+               NamedAttribute(builder.getStringAttr("period"),
+                              builder.getI64IntegerAttr(
+                                  *problem.getInitiationInterval()))}));
+        }
+        newOp->setAttr(resourceBindingsAttrName,
+                       ArrayAttr::get(builder.getContext(), bindingAttrs));
+      } else if (auto resources = problem.getLinkedResourceTypes(op)) {
+        SmallVector<Attribute> reservations;
+        for (auto resource : *resources) {
+          auto tableIt = rotatingSelectorTables.find(resource);
+          if (tableIt == rotatingSelectorTables.end())
+            continue;
+          auto &allocation = tableIt->second;
+          auto selectorsIt = allocation.selectors.find(op);
+          if (selectorsIt == allocation.selectors.end())
+            continue;
+          auto &selectors = selectorsIt->second;
+          SmallVector<NamedAttribute> attributes{
+              NamedAttribute(builder.getStringAttr("resource"),
+                             builder.getStringAttr(resource.getValue())),
+              NamedAttribute(builder.getStringAttr("phase"),
+                             builder.getI64IntegerAttr(
+                                 startTime % *problem.getInitiationInterval())),
+              NamedAttribute(
+                  builder.getStringAttr("period"),
+                  builder.getI64IntegerAttr(*problem.getInitiationInterval())),
+              NamedAttribute(
+                  builder.getStringAttr("hold"),
+                  builder.getI64IntegerAttr(
+                      problem.getResourceInitiationInterval(resource).value_or(
+                          1))),
+              NamedAttribute(builder.getStringAttr("instances"),
+                             builder.getI64IntegerAttr(allocation.instances))};
+          SmallVector<Attribute> selectorAttrs;
+          for (unsigned selector : selectors)
+            selectorAttrs.push_back(builder.getI64IntegerAttr(selector));
+          attributes.push_back(NamedAttribute(
+              builder.getStringAttr("selector"),
+              ArrayAttr::get(builder.getContext(), selectorAttrs)));
+          attributes.push_back(
+              NamedAttribute(builder.getStringAttr("selector_period"),
+                             builder.getI64IntegerAttr(selectors.size())));
+          reservations.push_back(
+              DictionaryAttr::get(builder.getContext(), attributes));
+        }
+        if (!reservations.empty())
+          newOp->setAttr(rotatingReservationsAttrName,
+                         ArrayAttr::get(builder.getContext(), reservations));
+      }
 
       // All further uses in this stage should used the cloned-version of values
       // So we update the mapping in this stage

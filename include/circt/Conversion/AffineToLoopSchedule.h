@@ -11,6 +11,7 @@
 #define CIRCT_CONVERSION_AFFINETOLOOPSCHEDULE_H_
 
 #include <memory>
+#include <string>
 
 namespace mlir {
 class Pass;

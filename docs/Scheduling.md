@@ -266,10 +266,16 @@ as well as redundant iteration over the problem components.
   assumed to be fully pipelined.
 - [SharedOperatorsProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1SharedOperatorsProblem.html):
   A resource-constrained scheduling problem that corresponds to multiplexing
-  multiple operations onto a pre-allocated number of fully pipelined operator
-  instances.
+  multiple operations onto a pre-allocated number of operator instances. A
+  resource type has a `limit` and may have an `ii` property, which is the
+  number of cycles for which each issued request reserves an instance. If `ii`
+  is omitted, it is one and the resource is fully pipelined. The optional
+  `cost` property denotes the implementation cost of one instance and can be
+  used by an outer resource-allocation exploration.
 - [ModuloProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ModuloProblem.html):
-  Models an HLS classic: Pipeline scheduling with limited resources.
+  Models an HLS classic: pipeline scheduling with loop-carried dependences and
+  limited resources. Its periodic reservation check includes each resource's
+  multi-cycle `ii`, and an operation may consume more than one resource type.
 - [ChainingProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ChainingProblem.html):
   Extends `Problem` to consider the accumulation of physical propagation delays
   on combinational paths along SSA dependences.
@@ -302,9 +308,323 @@ chaining-enabled modulo scheduling problem.
   heuristics. This family of schedulers shares a tailored implementation of the
   simplex algorithm, as proposed by de Dinechin. See the sources for more
   details and literature references.
+- Node-level reinforcement-learning scheduler
+  ([`NodeRLScheduler.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/NodeRLScheduler.cpp)):
+  Solves acyclic `SharedOperatorsProblem` instances with a resource-aware list
+  scheduler and `ModuloProblem` instances with a cyclic difference-constraint
+  scheduler. For modulo scheduling it searches increasing IIs, models
+  loop-carried edges with their dependence distance, and resolves conflicts in
+  a modulo reservation table. At each resource-ordering decision, a lightweight
+  linear policy chooses between contending nodes; REINFORCE updates the policy
+  from the final objective latency. This is episodic Monte Carlo policy-gradient
+  learning: it has no value network, temporal-difference bootstrap, replay
+  buffer, or Monte Carlo tree search. An individual pairwise choice resembles a
+  contextual-bandit action, but all choices in the schedule receive the same
+  delayed terminal reward, so they are not trained as independent bandit pulls.
+  An exponential moving-average reward is used as the REINFORCE baseline.
+
+  The constraint solver, rather than the policy, computes start times and
+  enforces dependences. The policy only selects a disjunctive ordering when two
+  periodic reservations conflict. Each II's dependence-only solution is
+  computed once. Adding a resource-ordering edge then propagates only increased
+  start times through a worklist; a second relaxation of the newly added edge
+  detects the positive cycle that makes that ordering infeasible. This avoids
+  resolving every difference constraint from zero after every action. Internal
+  resource-ordering edges have signed iteration offsets. This matters when two
+  absolute starts differ by one or more whole IIs but still alias the same
+  modulo phase: a zero-distance edge would be weaker than the existing data
+  dependence and could never move either reservation.
+
+  Before search, all users of a limited resource are joined, followed by SCC
+  closure of the dependence quotient. These maximal resource/SCC clusters are
+  solved independently. Inter-cluster constraints form a DAG and are satisfied
+  by shifting whole cluster schedules, which preserves every modulo phase. A
+  resource with at least 32 users, a pool of at least four instances with at
+  least 16 users, or a cluster coupling several resources with at least eight
+  users is first ordered in virtual lanes. The lanes are internal precedence
+  restrictions, not additional hardware. If that safe restriction is
+  infeasible the scheduler falls back to incremental pairwise conflict repair.
+  This avoids quadratic overflow repair on large pools while retaining flexible
+  ordering on small low-capacity problems.
+
+  The best feasible episode is retained, training is reproducible with a fixed
+  seed, and nodes may use multiple limited resources. If an episode proposes an
+  ordering constraint it already contains, the episode terminates because it
+  cannot change the current solution. The configured `episodes` is a maximum.
+  Modulo training also stops after a graph-size-dependent interval without an
+  improvement. `episode-node-budget` controls this deterministic stagnation
+  window: its value is divided by the number of nodes, with a minimum of eight
+  episodes; zero disables adaptive stopping. The default 65,536 node-episode
+  budget leaves small graphs unchanged while bounding unproductive exploration
+  on large graphs. `resource-ordering-budget` independently bounds the number
+  of precedence decisions across all candidate IIs. Through `ssp-schedule`,
+  select `scheduler=node-rl` and configure `episodes`,
+  `episode-node-budget`, `resource-ordering-budget`, `seed`, `learning-rate`,
+  and `exploration` in the scheduler options.
+
+  In an OR-Tools build, `local-search-nodes` optionally re-optimizes a bounded
+  neighborhood after NodeRL finds its smallest feasible II. The neighborhood
+  combines tight dependence fan-in of the sink with operations competing for
+  the same resources. Nodes outside it remain fixed through boundary
+  release/deadline constraints, and their periodic reservations are subtracted
+  from local capacity. CP-SAT receives the incumbent as a hint, minimizes the
+  sink at the fixed II, and commits only a globally verified improvement.
+  `local-search-time-limit` bounds this step. Local search defaults to zero
+  nodes because it requires OR-Tools and can add cost without helping already
+  regular large schedules; it does not try a lower II.
+
+  The C++
+  `exploreNodeRLPareto` API evaluates complete resource allocations and returns
+  the non-dominated latency/implementation-cost frontier; modulo points also
+  carry their II, which participates in dominance. NodeRL emits a `bindings`
+  property for each limited operation when a static physical assignment can be
+  represented. The API's overload accepting a cost function can evaluate
+  non-linear or post-synthesis cost estimates.
+
+  The current `bindings` property is a static operation-to-instance mapping.
+  A resource hold/II longer than the pipeline II is nevertheless scheduled
+  correctly through the modulo reservation table: the operation rotates across
+  physical instances in successive iterations. Such a schedule deliberately
+  has no static `bindings` property. Affine-to-LoopSchedule instead preserves
+  the periodic request as `circt.rotating_resource_reservations` metadata on
+  the cloned operation. Each entry records `resource`, launch `phase`, pipeline
+  `period`, reservation `hold`, available `instances`, plus a verified
+  `selector` table and `selector_period`. The coloring searches for the
+  shortest feasible selector period and `instances` is the number of colors
+  actually used rather than the configured upper bound. Metadata is emitted
+  only when the periodic coloring succeeds. This is sufficient for a
+  downstream periodic arbiter. LoopSchedule-to-Calyx implements a constrained
+  case for rotating integer multiplies. It creates the selected multiplier
+  instances, initializes a phase register for every pipeline invocation,
+  dispatches through selector guards, and advances the phase on completion.
+  Multiple operations are accepted when their selector instance sets are
+  disjoint.
+
+  This lowering boundary is covered by regression tests. A recurrence with
+  `limit<2>, ii<4>` and pipeline II 3 emits `selector<[0, 1]>` with selector
+  period 2 and lowers to two guarded `calyx.std_mult_pipe` cells. Two operations
+  with selector sets `[0,1]` and `[2,3]` lower to a four-cell shared pool;
+  overlapping selector sets remain rejected until completion ownership is
+  carried with each request. Static `hold > 1` bindings and two operations
+  sharing one static instance are also rejected: the current steady-state
+  `calyx.par` does not preserve their distinct stage start cycles. A single
+  static owner is supported. These constraints separate a scheduling/resource
+  result from a general RTL implementation claim.
+  [`RotatingReservationLowering.md`](RotatingReservationLowering.md) records
+  the selector-table contract and the required cycle-accurate lowering work.
+  A direct Calyx-to-Verilog Verilator experiment evaluates a five-iteration
+  recurrence to the expected value 243 for both a static control case and the
+  two-instance rotating case. The same Calyx programs currently stall after
+  `calyx-native` and `lower-calyx-to-hw`, including the non-rotating control:
+  the generated FSM continuously writes a `calyx.register`, but Calyx-to-HW
+  suppresses writes while that register's delayed `done` is high. This is a
+  downstream native-lowering limitation rather than evidence of a rotating
+  selector failure; RTL obtained through that path is treated as structural
+  until the register protocol is aligned.
+
+  `utils/run_modulo_node_rl_bench.py` generates reproducible microbenchmarks
+  with loop-carried chains, multiple resources, and resource holding times.
+  The `gemm`, `2mm`, `jacobi-2d`, and `covariance` modes are scheduling proxies
+  for PolyBench inner loops. `--chains` models independent output tiles and
+  `--unrolls` controls the scalar work retained in one modulo iteration. The
+  proxy deliberately excludes affine-index expansion and memory banking. Real
+  Affine loop structure and lowering are covered separately by
+  `test/Conversion/AffineToLoopSchedule/polybench-inner.mlir`.
+
+  The CSV contains scheduler status, CP-SAT's resource/dependence lower bound,
+  II, sink latency, configured resource limits/cost, static-binding count,
+  seed, and wall time. CP-SAT starts at that bound rather than enumerating from
+  II=1. The script also emits multi-seed summaries and per-seed Pareto
+  frontiers. A representative small comparison can be reproduced for each
+  kernel with:
+
+  ```sh
+  python3 utils/run_modulo_node_rl_bench.py \
+    --circt-opt build-fc092/bin/circt-opt --kernel KERNEL \
+    --chains 4 --unrolls 2 --episodes 32 256 \
+    --seeds 0 1 2 3 4 5 6 7 8 9 \
+    --mul-limit 2 --mul-ii 3 --div-limit 1 --div-ii 2 \
+    --cpsat --timeout 15
+  ```
+
+  The following snapshot uses the 32-episode rows. `L min/median/max` is over
+  ten NodeRL seeds. CP-SAT runs once and proves the lexicographic minimum II and
+  then sink latency. The LNS column uses 16 nodes and 0.2 seconds, except
+  Jacobi-2D, which uses 32 nodes and one second. Times are mean wall times.
+
+  | held-resource proxy | CP-SAT optimum | NodeRL | NodeRL + local CP-SAT |
+  | --- | --- | --- | --- |
+  | GEMM / 17 nodes | II 16, L 17; 0.128 s | II 16, L 18/19/19; <0.06 s | II 16, L 17/17/18; 0.075 s |
+  | 2MM / 33 nodes | II 32, L 33; 0.377 s | II 32, L 33/33/34; <0.04 s | II 32, L 33/33/34; 0.068 s |
+  | Jacobi-2D / 33 nodes | II 32, L 33; 0.426 s | II 32, L 38/40.5/44; <0.05 s | II 32, L 33/33.5/36; 1.026 s |
+  | Covariance / 25 nodes | II 32, L 27; 0.283 s | II 32, L 32/32/32; <0.06 s | II 32, L 27/27/27; 0.078 s |
+
+  Raising the episode maximum to 256 changes median latency to 18, 33, 39.5,
+  and 32 respectively, so additional Monte Carlo samples do not reliably close
+  the nonlocal latency gap. A full 33-node, two-second Jacobi neighborhood
+  reaches L=33 in all ten seeds in 2.049 seconds on average. That is effectively
+  a fixed-II exact solve and is slower than full CP-SAT on this small graph;
+  bounded neighborhoods are intended for graphs where the global model is no
+  longer cheap. LNS never changes II, so a primary-II miss must be repaired by
+  better structural ordering or by running the exact scheduler.
+
+  The existing fully-pipelined, single-resource-per-operation Modulo regression
+  set provides a direct comparison with Simplex:
+
+  | problem | Simplex II / L | NodeRL II / L | CP-SAT II / L |
+  | --- | ---: | ---: | ---: |
+  | canis14_fig2 | 4 / 4 | 3 / 5 | 3 / 5 |
+  | ceil_resource_mii | 3 / 3 | 3 / 3 | 3 / 3 |
+  | minII_feasible | 3 / 14 | 3 / 14 | 3 / 14 |
+  | minII_infeasible | 4 / 5 | 4 / 5 | 4 / 5 |
+  | four_read_pipeline | 4 / 8 | 4 / 8 | 4 / 8 |
+
+  The five instances take approximately 0.02 seconds together with either
+  Simplex or NodeRL and 0.05 seconds with CP-SAT. NodeRL deliberately compares
+  II before sink latency, explaining the canis tradeoff. Simplex remains the
+  smaller deterministic choice in its supported domain. The held-resource
+  proxies are not equivalent Simplex inputs; even after removing holds and
+  multiple-resource uses, these generated recurrences currently report that
+  the Simplex heuristic cannot update its frozen assignment while expanding
+  II. That rejection is recorded as a failed run rather than compared as a
+  timing result.
+
+  Resource allocation is a separate outer decision. This command sweeps the
+  two instance counts with costs 3 and 5 per multiplier and divider:
+
+  ```sh
+  python3 utils/run_modulo_node_rl_bench.py \
+    --circt-opt build-fc092/bin/circt-opt --kernel 2mm \
+    --chains 4 --unrolls 2 --episodes 32 --seeds 0 1 2 3 4 \
+    --mul-limits 1 2 4 --mul-ii 3 --div-limits 1 2 --div-ii 2 \
+    --mul-cost 3 --div-cost 5 --cpsat --timeout 10
+  ```
+
+  The CP-SAT non-dominated points and corresponding NodeRL medians are:
+
+  | mul/div instances | cost | CP-SAT II / L | NodeRL II / median L |
+  | ---: | ---: | ---: | ---: |
+  | 1 / 1 | 8 | 48 / 48 | 48 / 48 |
+  | 2 / 1 | 11 | 32 / 33 | 32 / 33 |
+  | 2 / 2 | 16 | 24 / 24 | 24 / 42 |
+  | 4 / 2 | 22 | 16 / 17 | 16 / 17 |
+
+  At cost 16, a 32-node, one-second local search returns II/L=24/24 in all five
+  seeds (0.275 seconds mean wall time). Thus the raw linear policy can miss a
+  Pareto point through latency even when it finds every minimum II; the hybrid
+  retains it without training a neural model. Across the full six-allocation
+  sweep CP-SAT takes 0.172--0.531 seconds per point and NodeRL 0.028--0.040
+  seconds per seed. Costs are scheduling surrogates, not synthesized area.
+
+  Large held-resource graphs exercise exact resource/SCC decomposition and
+  bulk virtual lanes. The following uses eight disjoint resource clusters, 32
+  configured episodes, multiplier hold 3/limit 2, and divider hold 2/limit 1:
+
+  ```sh
+  python3 utils/run_modulo_node_rl_bench.py \
+    --circt-opt build-fc092/bin/circt-opt --kernel 2mm \
+    --chains 64 128 256 512 1024 --unrolls 2 --episodes 32 \
+    --seed 7 --resource-clusters 8 \
+    --mul-limit 2 --mul-ii 3 --div-limit 1 --div-ii 2
+  ```
+
+  | operations | NodeRL II / L | wall time |
+  | ---: | ---: | ---: |
+  | 513 | 64 / 65 | 0.035 s |
+  | 1,025 | 128 / 129 | 0.053 s (ten-seed mean) |
+  | 2,049 | 256 / 257 | 0.058 s |
+  | 4,097 | 512 / 513 | 0.091 s |
+  | 8,193 | 1024 / 1025 | 0.185 s |
+
+  All reported runs attain the dominant resource-demand II bound and produce a
+  static binding for every non-sink operation; the 1,025-node success rate is
+  100% over ten seeds. These are scheduling-operation counts, not gates. They
+  show that neither a GPU nor neural inference is needed at the current target
+  scale. A single resource/SCC cluster containing thousands of mutually coupled
+  operations can still be harder than this decomposable benchmark, so the work
+  and ordering budgets remain necessary safeguards.
+
+  Two structural regressions are especially relevant to interpreting the RL
+  result. Signed resource offsets make NodeRL match CP-SAT on all five direct
+  Simplex comparison cases, including starts separated by a whole II. For
+  operations that simultaneously use two held resources, coupled bulk ordering
+  changes 15- and 29-node synthetic results from II 13/26 to the exact II 12/24
+  across ten seeds. These gains came from correcting the search space and its
+  constraint representation, not from a larger policy.
+
+  A neural policy or MCTS is therefore gated rather than planned by default.
+  Measure at least ten seeds on CP-SAT-solvable clusters and introduce a small
+  GNN/actor-critic only if a median II or sink-latency gap above 10%, or a gap
+  above 5% on at least three graph families, persists after structural fixes
+  and a fixed local-search budget. Also require evidence that policy scoring,
+  rather than constraint propagation, dominates runtime. Global MCTS is not a
+  suitable first fallback because pairwise resource ordering has quadratic
+  branching and a depth proportional to the number of conflicts. If synthesis
+  later supplies a black-box area/timing reward, a 20--100-node local tree whose
+  actions select a resource order or LNS neighborhood may become useful.
+
+  The present evidence does not cross that gate: raw Jacobi and Covariance
+  latency gaps exceed 10%, but bounded local CP-SAT removes or nearly removes
+  them, and the large CPU runs are already subsecond. The best episode's start
+  times and bindings are committed together only after training; transient
+  exploratory episodes never alter the selected schedule. Aggregate modulo
+  reservations without static bindings still require the rotating arbitration
+  described above. The modulo Simplex heuristic likewise reports failure if II
+  expansion cannot update its frozen assignment or verification rejects its
+  candidate, rather than emitting invalid IR.
+
+- CP-SAT scheduler (requires OR-Tools):
+  Solves `SharedOperatorsProblem` and `ModuloProblem` instances through
+  `scheduler=cpsat`. For modulo instances it computes the resource-demand bound,
+  raises it to the first II satisfying all cyclic difference constraints, then
+  enumerates IIs in increasing order. At each candidate it exactly minimizes
+  the designated sink start time and encodes every resource reservation phase.
+  `report-statistics=true` prints both the lower bound and selected II. It is
+  intended as a small-instance optimality oracle for NodeRL, not as the
+  large-graph production scheduler. CP-SAT returns reservation feasibility but
+  does not currently synthesize static resource bindings.
+
 - Integer linear programming-based scheduler
   ([`LPSchedulers.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/LPSchedulers.cpp)):
   Demo implementation for using an ILP solver via the OR-Tools integration.
+
+### Integrating a scheduled implementation
+
+SSP is a problem interchange format, rather than an implementation IR. An HLS
+client should construct a `SharedOperatorsProblem` or `ModuloProblem` directly
+from its source operations, invoke `scheduleNodeRL`, and read each source
+operation's `startTime` and `resourceBindings` properties when constructing its
+own pipeline stages, control, and resource instances. For a modulo schedule it
+must additionally lower the returned pipeline II and loop-carried values. The
+client remains responsible for mapping an operator type to a typed
+implementation primitive (including operand/result widths and a module or
+Calyx primitive) and for connecting the assigned resource instance. This
+separation lets the scheduling infrastructure remain dialect-agnostic while
+preserving a path to RTL and post-synthesis cost calibration. A resource `cost`
+is an inexpensive per-unit surrogate for exploration; it does not account for
+allocation-dependent mux, control, register, or routing cost. Clients should
+synthesize the small set of returned Pareto candidates, use the measured
+area/timing/power to make the final choice, and, when appropriate, update their
+resource-cost estimates for later explorations.
+
+For the existing Affine demonstration flow, pass
+`-convert-affine-to-loopschedule="scheduler=node-rl"` selects Modulo NodeRL
+instead of the default simplex scheduler; `scheduler=cpsat` selects the exact
+reference solver in an OR-Tools-enabled build. Both lower the resulting
+II/start times to `loopschedule.pipeline`; `node-rl-episodes`,
+`node-rl-episode-node-budget`, `node-rl-resource-ordering-budget`, and
+`node-rl-seed` control the reproducible NodeRL search.
+`node-rl-local-search-nodes` and `node-rl-local-search-time-limit` enable the
+optional OR-Tools neighborhood. With `multiplier-limit=N` and
+`multiplier-ii=H`, the flow also models N shared multiplier instances with a
+hold/accept interval of H cycles and preserves static bindings as metadata.
+LoopSchedule-to-Calyx consumes a single-owner static binding and the
+rotating selectors described above. It accepts cross-operation pools only when
+their selected physical instance sets are disjoint; overlapping ownership
+needs cycle-accurate stage control and completion tags. Merely placing
+nominally time-disjoint groups in `calyx.par` would drive the same cell
+concurrently. Other resource kinds still require target-specific lowering
+support.
 
 ## Utilities
 

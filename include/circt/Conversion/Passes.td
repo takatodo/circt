@@ -27,6 +27,26 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     the loops to a LoopSchedule.
   }];
   let constructor = "circt::createAffineToLoopSchedule()";
+  let options = [
+    Option<"scheduler", "scheduler", "std::string", "\"simplex\"",
+           "Modulo scheduler to use: simplex, node-rl, or cpsat when OR-Tools is enabled">,
+    Option<"multiplierLimit", "multiplier-limit", "unsigned", "0",
+           "Number of shared multiplier instances (zero means unbounded)">,
+    Option<"multiplierII", "multiplier-ii", "unsigned", "1",
+           "Multiplier resource initiation interval">,
+    Option<"nodeRLEpisodes", "node-rl-episodes", "unsigned", "64",
+           "Maximum number of NodeRL policy-training episodes per candidate II">,
+    Option<"nodeRLEpisodeNodeBudget", "node-rl-episode-node-budget", "unsigned", "65536",
+           "Node-episode stagnation budget for adaptive NodeRL stopping (zero disables)">,
+    Option<"nodeRLResourceOrderingBudget", "node-rl-resource-ordering-budget", "unsigned", "1048576",
+           "Global NodeRL resource-ordering constraint budget (zero disables)">,
+    Option<"nodeRLLocalSearchNodes", "node-rl-local-search-nodes", "unsigned", "0",
+           "CP-SAT modulo local-search neighborhood size after NodeRL (zero disables)">,
+    Option<"nodeRLLocalSearchTimeLimit", "node-rl-local-search-time-limit", "double", "0.1",
+           "CP-SAT wall-time limit in seconds for the NodeRL local-search neighborhood">,
+    Option<"nodeRLSeed", "node-rl-seed", "unsigned", "0",
+           "NodeRL random seed">
+  ];
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect",
     "mlir::arith::ArithDialect",

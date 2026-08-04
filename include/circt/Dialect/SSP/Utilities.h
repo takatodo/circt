@@ -366,6 +366,8 @@ ArrayAttr saveOperatorTypeProperties(ProblemT &prob, OperatorType opr,
 template <typename ProblemT, typename... ResourceTypePropertyTs>
 ArrayAttr saveResourceTypeProperties(ProblemT &prob, ResourceType rsrc,
                                      ImplicitLocOpBuilder &b) {
+  (void)prob;
+  (void)rsrc;
   SmallVector<Attribute> props;
   Attribute prop;
   // Fold expression: Expands to a `getFromProblem` and a conditional
@@ -379,6 +381,8 @@ ArrayAttr saveResourceTypeProperties(ProblemT &prob, ResourceType rsrc,
 template <typename ProblemT, typename... DependencePropertyTs>
 ArrayAttr saveDependenceProperties(ProblemT &prob, Dependence dep,
                                    ImplicitLocOpBuilder &b) {
+  (void)prob;
+  (void)dep;
   SmallVector<Attribute> props;
   Attribute prop;
   // Fold expression: Expands to a `getFromProblem` and a conditional
@@ -632,10 +636,12 @@ struct Default<scheduling::ChainingProblem> {
 template <>
 struct Default<scheduling::SharedOperatorsProblem> {
   static constexpr auto operationProperties =
-      Default<scheduling::Problem>::operationProperties;
+      std::tuple_cat(Default<scheduling::Problem>::operationProperties,
+                     std::make_tuple(ResourceBindingsAttr()));
   static constexpr auto operatorTypeProperties =
       Default<scheduling::Problem>::operatorTypeProperties;
-  static constexpr auto resourceTypeProperties = std::make_tuple(LimitAttr());
+  static constexpr auto resourceTypeProperties = std::make_tuple(
+      LimitAttr(), ResourceInitiationIntervalAttr(), ResourceCostAttr());
   static constexpr auto dependenceProperties =
       Default<scheduling::Problem>::dependenceProperties;
   static constexpr auto instanceProperties =
@@ -645,7 +651,7 @@ struct Default<scheduling::SharedOperatorsProblem> {
 template <>
 struct Default<scheduling::ModuloProblem> {
   static constexpr auto operationProperties =
-      Default<scheduling::Problem>::operationProperties;
+      Default<scheduling::SharedOperatorsProblem>::operationProperties;
   static constexpr auto operatorTypeProperties =
       Default<scheduling::SharedOperatorsProblem>::operatorTypeProperties;
   static constexpr auto resourceTypeProperties =

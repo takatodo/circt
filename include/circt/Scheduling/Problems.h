@@ -475,14 +475,15 @@ public:
 /// This class models a resource-constrained scheduling problem. An optional,
 /// non-zero *limit* marks resource types to be *shared* by the operations using
 /// them. In an HLS setting, this corresponds to multiplexing multiple
-/// operations onto a pre-allocated number of operator instances. These
-/// instances are assumed to be *fully pipelined*, meaning each instance can
-/// accept new operands (coming from a distinct operation) in each time step.
+/// operations onto a pre-allocated number of operator instances. By default
+/// these instances are *fully pipelined*, meaning each accepts a new request
+/// in every time step. A resource type can instead specify a larger resource
+/// initiation interval, during which an issued request reserves its instance.
 ///
 /// A solution to this problem is feasible iff the number of operations that use
-/// a certain limited operator type, and start in the same time step, does not
-/// exceed the operator type's limit. These constraints do not apply to operator
-/// types without a limit (not set, or 0).
+/// a certain limited operator type whose reservation intervals overlap does
+/// not exceed the operator type's limit. These constraints do not apply to
+/// operator types without a limit (not set, or 0).
 class SharedOperatorsProblem : public virtual Problem {
 public:
   static constexpr auto name = "SharedOperatorsProblem";
@@ -493,6 +494,9 @@ protected:
 
 private:
   ResourceTypeProperty<unsigned> limit;
+  ResourceTypeProperty<unsigned> initiationInterval;
+  ResourceTypeProperty<unsigned> cost;
+  OperationProperty<SmallVector<unsigned>> resourceBindings;
 
 public:
   /// The limit is the maximum number of operations using \p rsrc that are
@@ -502,6 +506,35 @@ public:
   }
   void setLimit(ResourceType rsrc, unsigned val) { limit[rsrc] = val; }
 
+  /// The resource initiation interval is the minimum number of time steps
+  /// between two requests accepted by the same resource instance. If unset,
+  /// resources are fully pipelined and accept a request every time step.
+  std::optional<unsigned> getResourceInitiationInterval(ResourceType rsrc) {
+    return initiationInterval.lookup(rsrc);
+  }
+  void setResourceInitiationInterval(ResourceType rsrc, unsigned val) {
+    initiationInterval[rsrc] = val;
+  }
+
+  /// The non-negative implementation cost of one instance of this resource.
+  /// Clients that do not set a cost can use one as the uniform default when
+  /// comparing resource allocations.
+  std::optional<unsigned> getResourceCost(ResourceType rsrc) {
+    return cost.lookup(rsrc);
+  }
+  void setResourceCost(ResourceType rsrc, unsigned val) { cost[rsrc] = val; }
+
+  /// The physical instance selected for each limited resource used by an
+  /// operation. Bindings are ordered like the operation's limited resource
+  /// types.
+  std::optional<SmallVector<unsigned>> getResourceBindings(Operation *op) {
+    return resourceBindings.lookup(op);
+  }
+  void setResourceBindings(Operation *op, SmallVector<unsigned> bindings) {
+    resourceBindings[op] = std::move(bindings);
+  }
+  void clearResourceBindings() { resourceBindings.clear(); }
+
   virtual PropertyStringVector getProperties(ResourceType rsrc) override;
 
 protected:
@@ -509,22 +542,25 @@ protected:
   virtual LogicalResult checkLatency(Operation *op) override;
   /// \p rsrc is not oversubscribed in any time step.
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
+  /// \p rsrc's explicitly assigned instances do not overlap.
+  virtual LogicalResult verifyBindings(ResourceType rsrc);
 
 public:
+  virtual LogicalResult check() override;
   virtual LogicalResult verify() override;
 };
 
 /// This class models the modulo scheduling problem as the composition of the
-/// cyclic problem and the resource-constrained problem with fully-pipelined
-/// shared operators.
+/// cyclic problem and the resource-constrained problem with shared operators.
 ///
 /// A solution to this problem comprises an integer II and integer start times
 /// for all registered operations, and is feasible iff:
 ///  (1) The precedence constraints implied by the `CyclicProblem`'s dependence
 ///      edges are satisfied, and
-///  (2) The number of operations that use a certain limited operator type,
-///      and start in the same congruence class (= start time *mod* II), does
-///      not exceed the operator type's limit.
+///  (2) For every modulo phase, the number of overlapping periodic
+///      reservations of a limited resource does not exceed its limit. A
+///      reservation occupies the resource from issue for that resource's
+///      initiation interval, which defaults to one cycle.
 class ModuloProblem : public virtual CyclicProblem,
                       public virtual SharedOperatorsProblem {
 public:
@@ -536,8 +572,11 @@ protected:
 
   /// \p opr is not oversubscribed in any congruence class modulo II.
   virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
+  /// \p rsrc's explicitly assigned instances do not overlap modulo II.
+  virtual LogicalResult verifyBindings(ResourceType rsrc) override;
 
 public:
+  LogicalResult check() override;
   virtual LogicalResult verify() override;
 };
 

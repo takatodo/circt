@@ -172,7 +172,7 @@ protected:
   unsigned freeze(unsigned startTimeVariable, unsigned timeStep);
   void translate(unsigned column, int factor1, int factorS, int factorT);
   LogicalResult scheduleAt(unsigned startTimeVariable, unsigned timeStep);
-  void moveBy(unsigned startTimeVariable, unsigned amount);
+  LogicalResult moveBy(unsigned startTimeVariable, unsigned amount);
   unsigned getStartTime(unsigned startTimeVariable);
 
   void dumpTableau();
@@ -262,8 +262,9 @@ protected:
   enum { OBJ_LATENCY = 0, OBJ_AXAP /* i.e. either ASAP or ALAP */ };
   bool fillObjectiveRow(SmallVector<int> &row, unsigned obj) override;
   void updateMargins();
-  void scheduleOperation(Operation *n);
+  LogicalResult scheduleOperation(Operation *n);
   unsigned computeResMinII();
+  LogicalResult verifyCandidateSchedule();
 
 public:
   ModuloSimplexScheduler(ModuloProblem &prob, Operation *lastOp)
@@ -742,9 +743,17 @@ LogicalResult SimplexSchedulerBase::scheduleAt(unsigned startTimeVariable,
   return success();
 }
 
-void SimplexSchedulerBase::moveBy(unsigned startTimeVariable, unsigned amount) {
+LogicalResult SimplexSchedulerBase::moveBy(unsigned startTimeVariable,
+                                           unsigned amount) {
   assert(startTimeVariable < startTimeLocations.size());
   assert(frozenVariables.count(startTimeVariable));
+
+  // A frozen variable is normally non-basic. If a tableau update put it back
+  // into the basis, its location encodes a negative row number and cannot be
+  // used as a tableau column. The modulo heuristic has no valid way to shift
+  // this kind of assignment while changing the II.
+  if (isInBasis(startTimeVariable))
+    return failure();
 
   // Bookkeeping.
   frozenVariables[startTimeVariable] += amount;
@@ -757,6 +766,7 @@ void SimplexSchedulerBase::moveBy(unsigned startTimeVariable, unsigned amount) {
   // ... however, we typically batch-move multiple operations (otherwise, the
   // tableau may become infeasible on intermediate steps), so actually defer
   // solving to the caller.
+  return success();
 }
 
 unsigned SimplexSchedulerBase::getStartTime(unsigned startTimeVariable) {
@@ -1082,7 +1092,7 @@ void ModuloSimplexScheduler::updateMargins() {
   }
 }
 
-void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
+LogicalResult ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   auto oprN = *prob.getLinkedOperatorType(n);
   unsigned stvN = startTimeVariables[n];
 
@@ -1102,7 +1112,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
       auto fixedN = scheduleAt(stvN, ct);
       if (succeeded(fixedN)) {
         LLVM_DEBUG(dbgs() << "Success at t=" << ct << " " << *n << '\n');
-        return;
+        return success();
       }
       // Problem became infeasible with `n` at `ct`, roll back the MRT
       // assignment. Also, no later time can be feasible, so stop the search
@@ -1165,7 +1175,10 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
     // Shifting an additional `deltaJ` time steps then moves the op to a
     // different MRT slot, in order to make room for the operation that caused
     // the resource conflict.
-    moveBy(stvJ, phiJ + deltaJ);
+    if (failed(moveBy(stvJ, phiJ + deltaJ)))
+      return prob.getContainingOp()->emitError()
+             << "simplex modulo heuristic cannot update a frozen assignment "
+                "while expanding the II";
   }
 
   // Finally, increment the II and solve to apply the moves.
@@ -1189,6 +1202,7 @@ void ModuloSimplexScheduler::scheduleOperation(Operation *n) {
   auto enteredN = mrt.enter(n, tauN + deltaN);
   assert(succeeded(fixedN) && succeeded(enteredN));
   (void)fixedN, (void)enteredN;
+  return success();
 }
 
 unsigned ModuloSimplexScheduler::computeResMinII() {
@@ -1206,10 +1220,47 @@ unsigned ModuloSimplexScheduler::computeResMinII() {
   }
 
   for (auto pair : uses)
-    resMinII = std::max(
-        resMinII, (unsigned)ceil(pair.second / *prob.getLimit(pair.first)));
+    resMinII =
+        std::max(resMinII, (pair.second + *prob.getLimit(pair.first) - 1) /
+                               *prob.getLimit(pair.first));
 
   return resMinII;
+}
+
+LogicalResult ModuloSimplexScheduler::verifyCandidateSchedule() {
+  for (auto *dst : prob.getOperations())
+    for (auto dependence : prob.getDependences(dst)) {
+      auto *src = dependence.getSource();
+      uint64_t srcAvailable =
+          getStartTime(startTimeVariables[src]) +
+          *prob.getLatency(*prob.getLinkedOperatorType(src));
+      uint64_t dstStart =
+          getStartTime(startTimeVariables[dst]) +
+          uint64_t(prob.getDistance(dependence).value_or(0)) * parameterT;
+      if (srcAvailable > dstStart)
+        return prob.getContainingOp()->emitError()
+               << "simplex modulo heuristic produced an invalid precedence "
+                  "schedule";
+    }
+
+  SmallDenseMap<Problem::ResourceType, SmallDenseMap<unsigned, unsigned>>
+      reservations;
+  for (auto *op : prob.getOperations()) {
+    auto resources = prob.getLinkedResourceTypes(op);
+    if (!resources)
+      continue;
+    for (auto resource : *resources) {
+      auto limit = prob.getLimit(resource);
+      if (!limit || *limit == 0)
+        continue;
+      unsigned phase = getStartTime(startTimeVariables[op]) % parameterT;
+      if (++reservations[resource][phase] > *limit)
+        return prob.getContainingOp()->emitError()
+               << "simplex modulo heuristic produced an oversubscribed "
+                  "resource schedule";
+    }
+  }
+  return success();
 }
 
 LogicalResult ModuloSimplexScheduler::schedule() {
@@ -1253,7 +1304,8 @@ LogicalResult ModuloSimplexScheduler::schedule() {
     Operation *op = *opIt;
     unscheduled.erase(opIt);
 
-    scheduleOperation(op);
+    if (failed(scheduleOperation(op)))
+      return failure();
     scheduled.push_back(op);
   }
 
@@ -1261,6 +1313,9 @@ LogicalResult ModuloSimplexScheduler::schedule() {
              dbgs() << "Solution found with II = " << parameterT
                     << " and start time of last operation = "
                     << -getParametricConstant(0) << '\n');
+
+  if (failed(verifyCandidateSchedule()))
+    return failure();
 
   prob.setInitiationInterval(parameterT);
   for (auto *op : ops)
@@ -1364,6 +1419,32 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
 // Public API
 //===----------------------------------------------------------------------===//
 
+static LogicalResult
+requireFullyPipelinedResources(SharedOperatorsProblem &prob) {
+  for (auto resource : prob.getResourceTypes()) {
+    if (prob.getResourceInitiationInterval(resource).value_or(1) > 1)
+      return prob.getContainingOp()->emitError()
+             << "simplex scheduling does not support resource initiation "
+                "intervals greater than one";
+  }
+  for (auto *op : prob.getOperations()) {
+    auto resources = prob.getLinkedResourceTypes(op);
+    if (!resources)
+      continue;
+    SmallVector<Problem::ResourceType> limitedResources;
+    for (auto resource : *resources)
+      if (prob.getLimit(resource).value_or(0) > 0 &&
+          std::find(limitedResources.begin(), limitedResources.end(),
+                    resource) == limitedResources.end())
+        limitedResources.push_back(resource);
+    if (limitedResources.size() > 1)
+      return op->emitError(
+          "simplex scheduling does not support operations using multiple "
+          "limited resources");
+  }
+  return success();
+}
+
 LogicalResult scheduling::scheduleSimplex(Problem &prob, Operation *lastOp) {
   SimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
@@ -1377,12 +1458,18 @@ LogicalResult scheduling::scheduleSimplex(CyclicProblem &prob,
 
 LogicalResult scheduling::scheduleSimplex(SharedOperatorsProblem &prob,
                                           Operation *lastOp) {
+  if (failed(requireFullyPipelinedResources(prob)))
+    return failure();
+  prob.clearResourceBindings();
   SharedOperatorsSimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
 }
 
 LogicalResult scheduling::scheduleSimplex(ModuloProblem &prob,
                                           Operation *lastOp) {
+  if (failed(requireFullyPipelinedResources(prob)))
+    return failure();
+  prob.clearResourceBindings();
   ModuloSimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
 }

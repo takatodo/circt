@@ -12,3 +12,8 @@ add_circt_conversion_library(CIRCTAffineToLoopSchedule
   CIRCTSchedulingAnalysis
   CIRCTLoopSchedule
   )
+
+if(ortools_FOUND)
+  target_compile_definitions(obj.CIRCTAffineToLoopSchedule
+    PRIVATE SCHEDULING_OR_TOOLS)
+endif()

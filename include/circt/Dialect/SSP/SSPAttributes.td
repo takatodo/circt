@@ -145,4 +145,39 @@ def LimitProp : ResourceTypeProperty<SSPDialect,
   "Limit", "unsigned", "::circt::scheduling::SharedOperatorsProblem"> {
   let mnemonic = "limit";
 }
+def ResourceInitiationIntervalProp : ResourceTypeProperty<SSPDialect,
+  "ResourceInitiationInterval", "unsigned", "::circt::scheduling::SharedOperatorsProblem"> {
+  let mnemonic = "ii";
+}
+def ResourceCostProp : ResourceTypeProperty<SSPDialect,
+  "ResourceCost", "unsigned", "::circt::scheduling::SharedOperatorsProblem"> {
+  let mnemonic = "cost";
+}
+def ResourceBindingsProp : OperationProperty<SSPDialect,
+  "ResourceBindings", "::mlir::ArrayAttr", "::circt::scheduling::SharedOperatorsProblem"> {
+  let mnemonic = "bindings";
+  let extraClassDeclaration = [{
+    void setInProblem(::circt::scheduling::SharedOperatorsProblem &prob,
+                      ::mlir::Operation *op) {
+      SmallVector<unsigned> bindings;
+      for (auto binding : getValue().getAsRange<::mlir::IntegerAttr>())
+        bindings.push_back(binding.getUInt());
+      prob.setResourceBindings(op, bindings);
+    }
+    static ::mlir::Attribute getFromProblem(
+        ::circt::scheduling::SharedOperatorsProblem &prob,
+        ::mlir::Operation *op, ::mlir::MLIRContext *context) {
+      auto bindings = prob.getResourceBindings(op);
+      if (!bindings)
+        return {};
+      SmallVector<::mlir::Attribute> attrs;
+      for (auto binding : *bindings)
+        attrs.push_back(::mlir::IntegerAttr::get(
+            ::mlir::IntegerType::get(context, 64), binding));
+      return ResourceBindingsAttr::get(
+          context, ::mlir::ArrayAttr::get(context, attrs));
+    }
+  }];
+}
+
 #endif // CIRCT_DIALECT_SSP_SSPATTRIBUTES_TD
