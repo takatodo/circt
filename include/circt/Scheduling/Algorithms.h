@@ -19,6 +19,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace circt {
 namespace scheduling {
@@ -97,10 +98,27 @@ LogicalResult scheduleLP(CyclicProblem &prob, Operation *lastOp);
 /// time limit expires.
 enum class CPSATSolveStatus { optimal, feasible, infeasible, unknown };
 
+/// Resource encoding used by the exact modulo scheduler.
+enum class CPSATModuloResourceModel { autoSelect, oneHot, cumulative };
+
 /// Configuration for a CP-SAT scheduler invocation. A zero time limit leaves
 /// the search unbounded.
 struct CPSATSchedulerOptions {
   double timeLimitSeconds = 0.0;
+  /// Zero lets OR-Tools choose its default worker count.
+  unsigned numWorkers = 0;
+  /// Whether to optimize the designated last operation after minimizing II.
+  bool minimizeLatency = true;
+  /// Try a restricted balanced start-count model before the complete modulo
+  /// resource model. A failed restricted attempt always falls back. During
+  /// latency minimization, a verified candidate becomes a complete-model hint
+  /// and a safe objective upper bound.
+  bool enableBalancedProbe = false;
+  /// Per-candidate wall-clock cap for the restricted probe.
+  double balancedProbeTimeLimitSeconds = 1.0;
+  /// Auto-select avoids a large task/phase/hold Boolean expansion.
+  CPSATModuloResourceModel moduloResourceModel =
+      CPSATModuloResourceModel::autoSelect;
 };
 
 /// Result metadata for a CP-SAT invocation.
@@ -109,6 +127,12 @@ struct CPSATSchedulerResult {
   /// First candidate II after resource-demand and cyclic-dependence bounds.
   unsigned lowerBound = 0;
   unsigned initiationInterval = 0;
+  /// Effective modulo resource encoding and its avoided one-hot size.
+  CPSATModuloResourceModel moduloResourceModel =
+      CPSATModuloResourceModel::autoSelect;
+  uint64_t phaseIndicatorCount = 0;
+  bool balancedProbeAttempted = false;
+  bool balancedProbeSucceeded = false;
 };
 
 /// Solve the acyclic problem with shared operators using constraint programming
@@ -121,10 +145,10 @@ LogicalResult scheduleCPSAT(SharedOperatorsProblem &prob, Operation *lastOp,
 
 /// Solve the modulo scheduling problem using constraint programming and an
 /// external SAT solver. The scheduler enumerates initiation intervals in
-/// increasing order and, for each candidate, optimally minimizes the start
-/// time of \p lastOp while enforcing cyclic dependences and modulo resource
-/// reservations. Fails if no feasible schedule is found, or \p lastOp is not
-/// part of the problem.
+/// increasing order and optionally minimizes the start time of \p lastOp at
+/// the first feasible candidate while enforcing cyclic dependences and modulo
+/// resource reservations. Fails if no feasible schedule is found, or \p
+/// lastOp is not part of the problem.
 LogicalResult scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                             const CPSATSchedulerOptions &options = {},
                             CPSATSchedulerResult *result = nullptr);
@@ -179,6 +203,26 @@ struct NodeRLSchedulerOptions {
   /// disables the limit.
   unsigned resourceOrderingBudget = 1048576;
 
+  /// Number of independent MCTS trees used as a fixed-II feasibility rescue.
+  /// Zero disables the rescue. Trees share a wall-clock and resource-ordering
+  /// budget but use independent random streams.
+  unsigned mctsRescueTrees = 0;
+
+  /// Maximum number of simulations performed by each MCTS rescue tree.
+  unsigned mctsRescueSimulations = 8;
+
+  /// Number of distinct resource conflicts exposed to each MCTS tree node.
+  /// Each conflict contributes both possible ordering orientations.
+  unsigned mctsTreeWidth = 8;
+
+  /// Number of distinct resource conflicts considered at each rollout step.
+  /// This is separate from the retained tree width so inexpensive rollouts can
+  /// use a different action horizon.
+  unsigned mctsRolloutWidth = 8;
+
+  /// Total wall-clock limit for all MCTS rescue attempts in one schedule.
+  double mctsTimeLimitSeconds = 10.0;
+
   /// Re-optimize this many operations around the modulo objective with a
   /// bounded CP-SAT neighborhood after NodeRL finds its smallest feasible II.
   /// Zero disables local search. This requires an OR-Tools-enabled build.
@@ -208,6 +252,37 @@ struct ResourceAllocation {
   SmallVector<ResourceLimit, 4> limits;
 };
 
+/// One periodic resource reservation made by an operation in a modulo
+/// schedule. The operation issues in `phase` modulo `period` and occupies one
+/// of `instances` physical resources for `hold` cycles. Unlike a static
+/// binding, the selected physical instance may rotate between iterations.
+struct RotatingResourceReservation {
+  Problem::ResourceType resource;
+  unsigned phase;
+  unsigned period;
+  unsigned hold;
+  unsigned instances;
+};
+
+/// The schedule assigned to one operation in problem insertion order.
+struct OperationScheduleCertificate {
+  unsigned startTime;
+
+  /// Static instance assignments ordered like the operation's limited
+  /// resource types. This is absent when the operation uses rotating
+  /// reservations instead.
+  std::optional<SmallVector<unsigned, 2>> resourceBindings;
+
+  /// Periodic reservations used when no static resource binding exists.
+  SmallVector<RotatingResourceReservation, 2> rotatingReservations;
+};
+
+/// A self-contained schedule which can be reapplied without invoking a
+/// scheduler. Entries correspond one-to-one with `Problem::getOperations()`.
+struct ResourceScheduleCertificate {
+  SmallVector<OperationScheduleCertificate, 0> operations;
+};
+
 /// A non-dominated resource allocation discovered by an outer exploration.
 struct ResourceParetoPoint {
   ResourceAllocation allocation;
@@ -215,10 +290,54 @@ struct ResourceParetoPoint {
   uint64_t resourceCost;
   /// Pipeline II for a modulo schedule, or zero for an acyclic schedule.
   unsigned initiationInterval = 0;
+  ResourceScheduleCertificate schedule;
 };
+
+/// Apply and verify a previously captured Pareto point without rerunning its
+/// scheduler. The certificate must describe the operations in problem
+/// insertion order and its recorded latency must match `lastOp`'s start time.
+LogicalResult applyResourceParetoPoint(SharedOperatorsProblem &prob,
+                                       Operation *lastOp,
+                                       const ResourceParetoPoint &point);
+
+/// Modulo-scheduling variant. In addition to static resource bindings, this
+/// accepts explicit rotating reservations and restores the recorded II.
+LogicalResult applyResourceParetoPoint(ModuloProblem &prob, Operation *lastOp,
+                                       const ResourceParetoPoint &point);
 
 /// Computes the implementation cost of a complete resource allocation.
 using ResourceCostFunction = function_ref<uint64_t(const ResourceAllocation &)>;
+
+/// Schedule each complete resource allocation with CP-SAT and return the
+/// latency/resource-cost Pareto frontier. Missing acyclic bindings are
+/// synthesized deterministically from the verified interval schedule. The
+/// problem is left at the least-cost frontier point without rerunning CP-SAT.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   const CPSATSchedulerOptions &options = {});
+
+/// As above, but use a client-provided resource cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   ResourceCostFunction costFunction,
+                   const CPSATSchedulerOptions &options = {});
+
+/// Modulo-scheduling CP-SAT Pareto exploration. Unbound resource uses receive
+/// a static circular coloring when one is found cheaply, and otherwise are
+/// captured as explicit rotating reservations at the solver's selected II.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   const CPSATSchedulerOptions &options = {});
+
+/// As above, but use a client-provided resource cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   ResourceCostFunction costFunction,
+                   const CPSATSchedulerOptions &options = {});
 
 /// Solve an acyclic resource-constrained problem using node-level
 /// reinforcement learning.  The scheduler learns a priority policy over ready

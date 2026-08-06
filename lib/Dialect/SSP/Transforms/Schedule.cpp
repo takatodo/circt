@@ -98,6 +98,52 @@ static FailureOr<NodeRLSchedulerOptions> getNodeRLOptions(InstanceOp instOp,
       }
       continue;
     }
+    if (option.consume_front("mcts-trees=")) {
+      if (option.getAsInteger(10, result.mctsRescueTrees)) {
+        instOp.emitError("invalid node-rl 'mcts-trees' option; expected an "
+                         "unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-simulations=")) {
+      if (option.getAsInteger(10, result.mctsRescueSimulations) ||
+          result.mctsRescueSimulations == 0) {
+        instOp.emitError("invalid node-rl 'mcts-simulations' option; expected "
+                         "a positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-tree-width=")) {
+      if (option.getAsInteger(10, result.mctsTreeWidth) ||
+          result.mctsTreeWidth == 0) {
+        instOp.emitError("invalid node-rl 'mcts-tree-width' option; expected a "
+                         "positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-rollout-width=")) {
+      if (option.getAsInteger(10, result.mctsRolloutWidth) ||
+          result.mctsRolloutWidth == 0) {
+        instOp.emitError(
+            "invalid node-rl 'mcts-rollout-width' option; expected a positive "
+            "integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-time-limit=")) {
+      if (option.getAsDouble(result.mctsTimeLimitSeconds) ||
+          !std::isfinite(result.mctsTimeLimitSeconds) ||
+          result.mctsTimeLimitSeconds <= 0.0) {
+        instOp.emitError("invalid node-rl 'mcts-time-limit' option; expected a "
+                         "finite positive number");
+        return failure();
+      }
+      continue;
+    }
     if (option.consume_front("local-search-nodes=")) {
       if (option.getAsInteger(10, result.localSearchNodes)) {
         instOp.emitError("invalid node-rl 'local-search-nodes' option; "
@@ -171,6 +217,66 @@ static FailureOr<CPSATPassOptions> getCPSATOptions(InstanceOp instOp,
       }
       continue;
     }
+    if (option.consume_front("workers=")) {
+      if (option.getAsInteger(10, result.scheduler.numWorkers) ||
+          result.scheduler.numWorkers == 0) {
+        instOp.emitError(
+            "invalid cpsat 'workers' option; expected a positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("minimize-latency=")) {
+      if (option == "true")
+        result.scheduler.minimizeLatency = true;
+      else if (option == "false")
+        result.scheduler.minimizeLatency = false;
+      else {
+        instOp.emitError("invalid cpsat 'minimize-latency' option; expected "
+                         "true or false");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("balanced-probe=")) {
+      if (option == "true")
+        result.scheduler.enableBalancedProbe = true;
+      else if (option == "false")
+        result.scheduler.enableBalancedProbe = false;
+      else {
+        instOp.emitError("invalid cpsat 'balanced-probe' option; expected "
+                         "true or false");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("balanced-probe-time-limit=")) {
+      if (option.getAsDouble(result.scheduler.balancedProbeTimeLimitSeconds) ||
+          !std::isfinite(result.scheduler.balancedProbeTimeLimitSeconds) ||
+          result.scheduler.balancedProbeTimeLimitSeconds <= 0.0) {
+        instOp.emitError(
+            "invalid cpsat 'balanced-probe-time-limit' option; expected a "
+            "finite positive number");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("resource-model=")) {
+      if (option == "auto")
+        result.scheduler.moduloResourceModel =
+            CPSATModuloResourceModel::autoSelect;
+      else if (option == "onehot")
+        result.scheduler.moduloResourceModel = CPSATModuloResourceModel::oneHot;
+      else if (option == "cumulative")
+        result.scheduler.moduloResourceModel =
+            CPSATModuloResourceModel::cumulative;
+      else {
+        instOp.emitError("invalid cpsat 'resource-model' option; expected "
+                         "auto, onehot, or cumulative");
+        return failure();
+      }
+      continue;
+    }
     if (option.consume_front("report-statistics=")) {
       if (option == "true")
         result.reportStatistics = true;
@@ -201,6 +307,19 @@ static StringRef getCPSATStatusName(CPSATSolveStatus status) {
     return "unknown";
   }
   llvm_unreachable("unknown CP-SAT solve status");
+}
+
+static StringRef
+getCPSATResourceModelName(CPSATModuloResourceModel resourceModel) {
+  switch (resourceModel) {
+  case CPSATModuloResourceModel::autoSelect:
+    return "auto";
+  case CPSATModuloResourceModel::oneHot:
+    return "onehot";
+  case CPSATModuloResourceModel::cumulative:
+    return "cumulative";
+  }
+  llvm_unreachable("unknown CP-SAT resource model");
 }
 
 //===----------------------------------------------------------------------===//
@@ -431,7 +550,16 @@ static InstanceOp scheduleWithCPSAT(InstanceOp instOp, StringRef options,
     if (parsedOptions->reportStatistics)
       llvm::errs() << "cpsat: status=" << getCPSATStatusName(result.status)
                    << ", lower-bound=" << result.lowerBound
-                   << ", II=" << result.initiationInterval << "\n";
+                   << ", II=" << result.initiationInterval
+                   << ", resource-model="
+                   << getCPSATResourceModelName(result.moduloResourceModel)
+                   << ", phase-indicators=" << result.phaseIndicatorCount
+                   << ", balanced-probe="
+                   << (!parsedOptions->scheduler.enableBalancedProbe ? "off"
+                       : result.balancedProbeSucceeded               ? "hit"
+                       : result.balancedProbeAttempted               ? "miss"
+                                                       : "skipped")
+                   << "\n";
     return saveProblem(prob, builder);
   }
 

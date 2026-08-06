@@ -3,8 +3,10 @@
 ## Status
 
 Modulo NodeRL can schedule a resource whose hold time is greater than the
-pipeline II. `circt.rotating_resource_reservations` preserves this result on
-the corresponding LoopSchedule operation. It is a target-neutral contract.
+pipeline II, while CP-SAT can return a feasible periodic schedule without any
+instance bindings. `circt.rotating_resource_reservations` preserves an
+implementable instance-selection table for both cases on the corresponding
+LoopSchedule operation. It is a target-neutral contract.
 LoopSchedule-to-Calyx now implements a deliberately constrained slice of that
 contract: rotating integer multiply operations whose selected physical
 instance sets are disjoint. Multiple operations may use one resource pool when
@@ -16,25 +18,30 @@ An entry contains `resource`, `phase`, `period`, `hold`, and `instances`.
 When periodic coloring succeeds it also contains `selector` and
 `selector_period`. `selector[k]` names the physical instance to issue for
 iteration class `k mod selector_period`.
+A selector period of one is a static allocation synthesized for an unbound
+start-time schedule; a longer selector rotates between iterations.
 
 The table generator colors reservation intervals on a finite cyclic horizon,
 including wraparound. It searches selector periods from one through the
 resource limit and keeps the shortest feasible table. `instances` records the
 number of colors actually used, not the available upper bound, so a limit of
 four with selector `[0, 1]` materializes only two cells. The generator currently
-requires all uses of a resource to be rotating; mixing static and rotating
-users needs a joint allocator. Affine-to-LoopSchedule emits rotating metadata
-only when this coloring succeeds; an operation without a static binding is not
-by itself a rotating allocation.
+requires all uses of a resource to be unbound; mixing pre-existing static
+bindings with synthesized selectors needs a joint allocator.
+Affine-to-LoopSchedule emits reservation metadata only when this coloring
+succeeds; an operation without a static binding is not by itself a realizable
+allocation.
 
 ## Calyx boundary
 
 LoopSchedule-to-Calyx creates only the `std_mult_pipe` instances referenced by
-the selector tables. For each rotating operation it also creates a phase
+the selector tables. For a selector longer than one it also creates a phase
 register, resets that register before each pipeline invocation, compares it
 against every selector class, conditionally drives only the selected instance,
 joins that operation's instance completion signals into its result register,
-and advances the phase only when the selected operation completes.
+and advances the phase only when the selected operation completes. A
+period-one selector directly guards its single selected instance and requires
+no phase register.
 
 This is enough for the representative single-stage loop-carried recurrence:
 pipeline II 3, resource hold 4, and selector `[0, 1]`. It is not a general
@@ -66,6 +73,14 @@ compared at RTL or synthesis level. Automated regression coverage stops at
 verified Calyx IR. The representative case also passes through the installed
 native Calyx compiler and `lower-calyx-to-hw`, producing two `comb.mul`
 operations and one phase register.
+
+A separate CP-SAT representative uses two simultaneous multiplications,
+multiplier hold three, pipeline II three, and a two-instance limit. The start
+times are colored as period-one selectors `[0]` and `[1]`. Regression tests
+verify the two-cell Calyx pool, and a manual run through `calyx-native`,
+`lower-calyx-to-hw`, `lower-seq-to-sv`, and Verilog export produces exactly two
+RTL multipliers and no selector-phase register. This remains a structural
+result because of the native-lowering register protocol described below.
 
 An additional five-iteration recurrence experiment initializes its carried
 value to one and multiplies by three, so the expected result is 243. Exporting
@@ -112,7 +127,10 @@ longer over-allocates hardware.
   lowering: two multiplier cells, phase initialization, guarded dispatch, and
   completion-driven phase advance.
 - `node-rl-multiple-rotating-binding.mlir` verifies two operations with
-  disjoint selector sets (`[0,1]` and `[2,3]`).
+  disjoint NodeRL selector sets (`[0,1]` and `[2,3]`), plus CP-SAT period-one
+  selectors `[0]` and `[1]` and the resulting two-cell Calyx pool.
+- `cpsat-options.mlir` verifies that an unbound CP-SAT schedule retains its
+  period-one multiplier selectors in LoopSchedule IR.
 - `node-rl-overlapping-rotating-binding-error.mlir` verifies rejection when
   two operations select the same physical instances.
 - `node-rl-nonpipelined-binding-error.mlir` verifies rejection of static

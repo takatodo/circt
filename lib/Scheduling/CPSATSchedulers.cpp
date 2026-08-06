@@ -13,6 +13,8 @@
 
 #include "circt/Scheduling/Algorithms.h"
 
+#include "ResourceSchedule.h"
+
 #include "mlir/IR/Operation.h"
 
 #include "ortools/sat/cp_model.h"
@@ -250,6 +252,294 @@ static unsigned getSerialSpan(SharedOperatorsProblem &prob, Operation *task) {
   return span;
 }
 
+struct BalancedModuloProbeResult {
+  bool attempted = false;
+  SmallVector<int64_t> startTimes;
+};
+
+/// Try a restricted modulo model in which every limited resource uses a
+/// rotation of one legal balanced start-count pattern. A returned schedule is
+/// globally feasible, but failure is inconclusive and must fall back to a
+/// complete resource model.
+static BalancedModuloProbeResult
+tryBalancedModuloProbe(ModuloProblem &prob, unsigned ii, unsigned horizon,
+                       Operation *lastOp, bool minimizeLatency,
+                       double timeLimitSeconds, unsigned numWorkers) {
+  BalancedModuloProbeResult result;
+  auto &tasks = prob.getOperations();
+  SmallVector<Problem::ResourceType> resources;
+  SmallVector<SmallVector<Operation *>> resourceUsers;
+  SmallVector<SmallVector<int64_t>> startPatterns;
+  DenseSet<Operation *> limitedResourceUsers;
+
+  for (auto resource : prob.getResourceTypes()) {
+    unsigned limit = prob.getLimit(resource).value_or(0);
+    if (limit == 0)
+      continue;
+    SmallVector<Operation *> users;
+    for (Operation *task : tasks) {
+      auto linkedResources = prob.getLinkedResourceTypes(task);
+      if (linkedResources && llvm::is_contained(*linkedResources, resource))
+        users.push_back(task);
+    }
+    if (users.empty())
+      continue;
+    limitedResourceUsers.insert(users.begin(), users.end());
+    resources.push_back(resource);
+    resourceUsers.push_back(std::move(users));
+  }
+
+  constexpr unsigned maxResources = 5;
+  constexpr uint64_t maxModelSize = 125'000;
+  if (resources.empty() || resources.size() > maxResources)
+    return result;
+  uint64_t modelSize = 0;
+  auto addModelTerms = [&](uint64_t first, uint64_t second, uint64_t third) {
+    uint64_t remaining = maxModelSize - modelSize;
+    if (first != 0 && second > remaining / first)
+      return false;
+    uint64_t product = first * second;
+    if (product != 0 && third > remaining / product)
+      return false;
+    modelSize += product * third;
+    return true;
+  };
+  if (!addModelTerms(limitedResourceUsers.size(), ii, 1) ||
+      !addModelTerms(resources.size(), ii, ii))
+    return result;
+
+  for (auto [resourceIndex, resource] : llvm::enumerate(resources)) {
+    auto &users = resourceUsers[resourceIndex];
+    SmallVector<int64_t> counts(ii, 0);
+    for (unsigned user = 0; user != users.size(); ++user)
+      ++counts[static_cast<uint64_t>(user) * ii / users.size()];
+
+    unsigned resourceII =
+        prob.getResourceInitiationInterval(resource).value_or(1);
+    if (!addModelTerms(users.size(), ii, resourceII))
+      return result;
+    SmallVector<int64_t> occupancy(ii, 0);
+    for (unsigned phase = 0; phase != ii; ++phase)
+      for (unsigned offset = 0; offset != resourceII; ++offset)
+        occupancy[(phase + offset) % ii] += counts[phase];
+    unsigned limit = *prob.getLimit(resource);
+    if (llvm::any_of(occupancy,
+                     [limit](int64_t value) { return value > limit; }))
+      return result;
+    startPatterns.push_back(std::move(counts));
+  }
+
+  result.attempted = true;
+  auto probeStart = std::chrono::steady_clock::now();
+  auto solveCandidate = [&](bool singleStage) -> CpSolverStatus {
+    CpModelBuilder cpModel;
+    DenseMap<Operation *, IntVar> starts;
+    DenseMap<Operation *, IntVar> phases;
+    DenseMap<Operation *, SmallVector<BoolVar>> atPhase;
+    for (auto [index, task] : llvm::enumerate(tasks)) {
+      bool hasLimitedResource = limitedResourceUsers.contains(task);
+      starts[task] =
+          cpModel
+              .NewIntVar(singleStage && hasLimitedResource ? Domain(0, ii - 1)
+                                                           : Domain(0, horizon))
+              .WithName(
+                  (Twine("balanced_start_of_task_") + Twine(index)).str());
+      if (!hasLimitedResource)
+        continue;
+
+      // The first portfolio member keeps resource users in one representative
+      // iteration to remove stage symmetry. If it is infeasible, the second
+      // member restores absolute starts and modulo phases while retaining the
+      // same balanced resource patterns.
+      if (!singleStage) {
+        phases[task] =
+            cpModel.NewIntVar(Domain(0, ii - 1))
+                .WithName(
+                    (Twine("balanced_phase_of_task_") + Twine(index)).str());
+        cpModel.AddModuloEquality(phases[task], starts[task], ii);
+      }
+      LinearExpr encodedPhase;
+      auto &indicators = atPhase[task];
+      indicators.reserve(ii);
+      for (unsigned phase = 0; phase != ii; ++phase) {
+        BoolVar selected = cpModel.NewBoolVar();
+        indicators.push_back(selected);
+        encodedPhase += selected * phase;
+      }
+      cpModel.AddExactlyOne(indicators);
+      cpModel.AddEquality(singleStage ? starts[task] : phases[task],
+                          encodedPhase);
+    }
+
+    for (Operation *task : tasks) {
+      for (auto dependence : prob.getDependences(task)) {
+        Operation *source = dependence.getSource();
+        Operation *destination = dependence.getDestination();
+        unsigned latency =
+            *prob.getLatency(*prob.getLinkedOperatorType(source));
+        unsigned distance = prob.getDistance(dependence).value_or(0);
+        cpModel.AddGreaterOrEqual(starts[destination],
+                                  starts[source] + latency - distance * ii);
+      }
+    }
+
+    for (auto [resourceIndex, resource] : llvm::enumerate(resources)) {
+      auto &users = resourceUsers[resourceIndex];
+      auto &canonicalPattern = startPatterns[resourceIndex];
+      IntVar rotation = cpModel.NewIntVar(Domain(0, ii - 1));
+      int64_t maxStarts =
+          *llvm::max_element(canonicalPattern, std::less<int64_t>());
+      unsigned resourceII =
+          prob.getResourceInitiationInterval(resource).value_or(1);
+      unsigned limit = *prob.getLimit(resource);
+      for (unsigned phase = 0; phase != ii; ++phase) {
+        // This capacity constraint follows from the selected legal pattern,
+        // but stating it explicitly gives CP-SAT much stronger propagation
+        // between overlapping resources than the aggregate equalities alone.
+        LinearExpr occupancy;
+        for (Operation *user : users)
+          for (unsigned offset = 0; offset != resourceII; ++offset) {
+            unsigned startPhase = (phase + ii - offset % ii) % ii;
+            occupancy += atPhase[user][startPhase];
+          }
+        cpModel.AddLessOrEqual(occupancy, limit);
+
+        LinearExpr startsAtPhase;
+        for (Operation *user : users)
+          startsAtPhase += atPhase[user][phase];
+        SmallVector<int64_t> rotatedCounts;
+        rotatedCounts.reserve(ii);
+        for (unsigned candidate = 0; candidate != ii; ++candidate)
+          rotatedCounts.push_back(canonicalPattern[(phase + candidate) % ii]);
+        IntVar selectedCount = cpModel.NewIntVar(Domain(0, maxStarts));
+        cpModel.AddElement(rotation, rotatedCounts, selectedCount);
+        cpModel.AddEquality(startsAtPhase, selectedCount);
+      }
+    }
+
+    DenseMap<Operation *, unsigned> taskIndices;
+    for (auto [index, task] : llvm::enumerate(tasks))
+      taskIndices[task] = index;
+
+    auto solveWithRemainingTime = [&]() {
+      SatParameters parameters;
+      double elapsed = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - probeStart)
+                           .count();
+      double remainingTime = timeLimitSeconds - elapsed;
+      if (remainingTime <= 0.0)
+        return CpSolverResponse();
+      parameters.set_max_time_in_seconds(remainingTime);
+      parameters.set_cp_model_probing_level(0);
+      parameters.set_max_presolve_iterations(1);
+      if (numWorkers > 0)
+        parameters.set_num_search_workers(numWorkers);
+      Model model;
+      model.Add(NewSatParameters(parameters));
+      return SolveCpModel(cpModel.Build(), &model);
+    };
+
+    auto recordSolution = [&](const CpSolverResponse &response) {
+      SmallVector<int64_t> solverStarts;
+      SmallVector<int64_t> fixedPhases(tasks.size(), -1);
+      solverStarts.reserve(tasks.size());
+      for (auto [index, task] : llvm::enumerate(tasks)) {
+        int64_t start = SolutionIntegerValue(response, starts[task]);
+        solverStarts.push_back(start);
+        if (limitedResourceUsers.contains(task))
+          fixedPhases[index] = start % ii;
+      }
+
+      // A feasibility response may contain needlessly large stages, including
+      // when an objective run stops before proving optimality. Keep every
+      // resource phase fixed, then compute the component-wise earliest
+      // non-negative starts admitted by the dependence constraints.
+      // Non-resource operations have no phase restriction.
+      SmallVector<int64_t> tightenedStarts(tasks.size(), 0);
+      for (auto [index, phase] : llvm::enumerate(fixedPhases))
+        if (phase >= 0)
+          tightenedStarts[index] = phase;
+      bool converged = false;
+      for (unsigned iteration = 0; iteration <= tasks.size(); ++iteration) {
+        bool changed = false;
+        for (Operation *task : tasks) {
+          for (auto dependence : prob.getDependences(task)) {
+            unsigned sourceIndex = taskIndices.lookup(dependence.getSource());
+            unsigned destinationIndex =
+                taskIndices.lookup(dependence.getDestination());
+            int64_t latency = *prob.getLatency(
+                *prob.getLinkedOperatorType(dependence.getSource()));
+            int64_t distance = prob.getDistance(dependence).value_or(0);
+            int64_t required = tightenedStarts[sourceIndex] + latency -
+                               distance * static_cast<int64_t>(ii);
+            int64_t candidate = std::max<int64_t>(0, required);
+            int64_t phase = fixedPhases[destinationIndex];
+            if (phase >= 0) {
+              if (candidate <= phase)
+                candidate = phase;
+              else
+                candidate = phase + ((candidate - phase + ii - 1) / ii) * ii;
+            }
+            if (candidate > tightenedStarts[destinationIndex]) {
+              tightenedStarts[destinationIndex] = candidate;
+              changed = true;
+            }
+          }
+        }
+        if (!changed) {
+          converged = true;
+          break;
+        }
+      }
+      result.startTimes =
+          converged ? std::move(tightenedStarts) : std::move(solverStarts);
+    };
+
+    CpSolverResponse response = solveWithRemainingTime();
+    if (response.status() != CpSolverStatus::OPTIMAL &&
+        response.status() != CpSolverStatus::FEASIBLE)
+      return response.status();
+    recordSolution(response);
+    if (!minimizeLatency)
+      return response.status();
+
+    // Preserve a fast feasibility solution even if restricted latency
+    // optimization consumes the remaining probe budget. The complete model
+    // will receive whichever verified incumbent is best at probe exit.
+    for (auto [index, task] : llvm::enumerate(tasks)) {
+      int64_t hint = result.startTimes[index];
+      cpModel.AddHint(starts[task], hint);
+      if (!limitedResourceUsers.contains(task))
+        continue;
+      if (!singleStage)
+        cpModel.AddHint(phases[task], hint % ii);
+      for (unsigned phase = 0; phase != ii; ++phase)
+        cpModel.AddHint(atPhase[task][phase], hint % ii == phase);
+    }
+    unsigned lastIndex = taskIndices.lookup(lastOp);
+    cpModel.AddLessOrEqual(starts[lastOp], result.startTimes[lastIndex]);
+    cpModel.Minimize(starts[lastOp]);
+
+    CpSolverResponse optimizedResponse = solveWithRemainingTime();
+    if (optimizedResponse.status() == CpSolverStatus::OPTIMAL ||
+        optimizedResponse.status() == CpSolverStatus::FEASIBLE)
+      recordSolution(optimizedResponse);
+    return response.status();
+  };
+
+  CpSolverStatus status = solveCandidate(/*singleStage=*/true);
+  if (!result.startTimes.empty() || status != CpSolverStatus::INFEASIBLE)
+    return result;
+
+  double elapsed = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - probeStart)
+                       .count();
+  double remainingTime = timeLimitSeconds - elapsed;
+  if (remainingTime > 0.0)
+    solveCandidate(/*singleStage=*/false);
+  return result;
+}
+
 } // namespace
 
 /// Solve the shared operators problem by modeling it as a Resource
@@ -354,12 +644,19 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
     }
   }
 
-  cpModel.Minimize(taskEnds[lastOp]);
+  if (options.minimizeLatency)
+    cpModel.Minimize(taskEnds[lastOp]);
 
   Model model;
   if (options.timeLimitSeconds > 0.0) {
     SatParameters parameters;
     parameters.set_max_time_in_seconds(options.timeLimitSeconds);
+    if (options.numWorkers > 0)
+      parameters.set_num_search_workers(options.numWorkers);
+    model.Add(NewSatParameters(parameters));
+  } else if (options.numWorkers > 0) {
+    SatParameters parameters;
+    parameters.set_num_search_workers(options.numWorkers);
     model.Add(NewSatParameters(parameters));
   }
 
@@ -430,8 +727,76 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
   if (result)
     result->lowerBound = lowerBound;
 
+  DenseMap<Operation *, unsigned> taskIndices;
+  for (auto [index, task] : llvm::enumerate(tasks))
+    taskIndices[task] = index;
+
   auto startTime = std::chrono::steady_clock::now();
   for (unsigned ii = lowerBound; ii <= upperBound; ++ii) {
+    SmallVector<int64_t> balancedHintStarts;
+    uint64_t phaseIndicatorCount = 0;
+    for (auto resource : prob.getResourceTypes()) {
+      if (prob.getLimit(resource).value_or(0) == 0)
+        continue;
+      unsigned resourceII =
+          prob.getResourceInitiationInterval(resource).value_or(1);
+      for (Operation *task : tasks) {
+        auto resources = prob.getLinkedResourceTypes(task);
+        if (resources && llvm::is_contained(*resources, resource))
+          phaseIndicatorCount += static_cast<uint64_t>(ii) * resourceII;
+      }
+    }
+
+    if (options.enableBalancedProbe) {
+      double probeTime = options.balancedProbeTimeLimitSeconds;
+      if (options.timeLimitSeconds > 0.0) {
+        double elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - startTime)
+                             .count();
+        probeTime = std::min(probeTime, options.timeLimitSeconds - elapsed);
+      }
+      if (probeTime > 0.0) {
+        BalancedModuloProbeResult probe = tryBalancedModuloProbe(
+            prob, ii, horizon, lastOp, options.minimizeLatency, probeTime,
+            options.numWorkers);
+        if (result)
+          result->balancedProbeAttempted |= probe.attempted;
+        if (!probe.startTimes.empty()) {
+          prob.clearResourceBindings();
+          for (auto [task, start] : llvm::zip(tasks, probe.startTimes))
+            prob.setStartTime(task, start);
+          prob.setInitiationInterval(ii);
+          if (failed(prob.verify()))
+            return failure();
+          if (result) {
+            result->balancedProbeSucceeded = true;
+          }
+          if (!options.minimizeLatency) {
+            if (result) {
+              result->status = CPSATSolveStatus::optimal;
+              result->initiationInterval = ii;
+              result->moduloResourceModel = CPSATModuloResourceModel::oneHot;
+              result->phaseIndicatorCount = phaseIndicatorCount;
+            }
+            return success();
+          }
+          balancedHintStarts = std::move(probe.startTimes);
+        }
+      }
+    }
+
+    auto acceptBalancedIncumbent = [&]() -> LogicalResult {
+      assert(!balancedHintStarts.empty() &&
+             "expected a verified balanced incumbent");
+      if (result) {
+        result->status = CPSATSolveStatus::feasible;
+        result->initiationInterval = ii;
+        result->moduloResourceModel = CPSATModuloResourceModel::oneHot;
+        result->phaseIndicatorCount = phaseIndicatorCount;
+      }
+      return success();
+    };
+
     CpModelBuilder cpModel;
     DenseMap<Operation *, IntVar> starts;
     DenseMap<Operation *, IntVar> phases;
@@ -445,6 +810,16 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
           cpModel.NewIntVar(Domain(0, ii - 1))
               .WithName((Twine("phase_of_task_") + Twine(index)).str());
       cpModel.AddModuloEquality(phases[task], starts[task], ii);
+      if (!balancedHintStarts.empty()) {
+        int64_t hint = balancedHintStarts[index];
+        cpModel.AddHint(starts[task], hint);
+        cpModel.AddHint(phases[task], hint % ii);
+      }
+    }
+
+    if (!balancedHintStarts.empty()) {
+      unsigned lastIndex = taskIndices.lookup(lastOp);
+      cpModel.AddLessOrEqual(starts[lastOp], balancedHintStarts[lastIndex]);
     }
 
     for (Operation *task : tasks) {
@@ -458,6 +833,23 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
       }
     }
 
+    // The direct encoding below creates exactly one reified phase Boolean per
+    // task, phase, and reservation offset. It propagates latency objectives
+    // well on small problems, but its model size is prohibitive when both the
+    // graph and II are large. Periodic cumulative intervals avoid that
+    // expansion while remaining exact.
+    // Reified phase equalities carry substantially more SAT/presolve state
+    // than their raw Boolean count suggests.  A 900-operation Affine stencil
+    // with 30,624 indicators exceeded 500 MiB, while the equivalent cumulative
+    // model stayed below 140 MiB.  Keep auto below the 256 MiB practical target
+    // with a conservative boundary; callers can still request either encoding
+    // explicitly.
+    constexpr uint64_t maxAutoPhaseIndicators = 25'000;
+    bool useCumulativeResources =
+        options.moduloResourceModel == CPSATModuloResourceModel::cumulative ||
+        (options.moduloResourceModel == CPSATModuloResourceModel::autoSelect &&
+         phaseIndicatorCount > maxAutoPhaseIndicators);
+
     for (auto resource : prob.getResourceTypes()) {
       auto limit = prob.getLimit(resource);
       if (!limit || *limit == 0)
@@ -470,6 +862,23 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
       }
       unsigned resourceII =
           prob.getResourceInitiationInterval(resource).value_or(1);
+      if (useCumulativeResources) {
+        CumulativeConstraint cumulative = cpModel.AddCumulative(*limit);
+        // Check one complete II-wide window of the infinite periodic
+        // reservation table. Copies that start before that window can remain
+        // live inside it, so include enough preceding iterations to cover the
+        // resource hold.
+        unsigned precedingCopies = (resourceII + ii - 1) / ii;
+        for (Operation *task : users) {
+          for (int64_t copy = -static_cast<int64_t>(precedingCopies); copy <= 0;
+               ++copy) {
+            IntervalVar reservation = cpModel.NewFixedSizeIntervalVar(
+                phases[task] + copy * ii, resourceII);
+            cumulative.AddDemand(reservation, 1);
+          }
+        }
+        continue;
+      }
       for (unsigned phase = 0; phase != ii; ++phase) {
         LinearExpr reservations;
         for (Operation *task : users) {
@@ -480,6 +889,11 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                 .OnlyEnforceIf(usesPhase);
             cpModel.AddNotEqual(phases[task], requiredPhase)
                 .OnlyEnforceIf(~usesPhase);
+            if (!balancedHintStarts.empty()) {
+              unsigned taskIndex = taskIndices.lookup(task);
+              cpModel.AddHint(usesPhase, balancedHintStarts[taskIndex] % ii ==
+                                             requiredPhase);
+            }
             reservations += usesPhase;
           }
         }
@@ -487,7 +901,8 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
       }
     }
 
-    cpModel.Minimize(starts[lastOp]);
+    if (options.minimizeLatency)
+      cpModel.Minimize(starts[lastOp]);
     Model model;
     if (options.timeLimitSeconds > 0.0) {
       double elapsed = std::chrono::duration<double>(
@@ -495,19 +910,34 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                            .count();
       double remaining = options.timeLimitSeconds - elapsed;
       if (remaining <= 0.0) {
+        if (!balancedHintStarts.empty())
+          return acceptBalancedIncumbent();
         if (result)
           result->status = CPSATSolveStatus::unknown;
         return containingOp->emitError("CP-SAT time limit exceeded");
       }
       SatParameters parameters;
       parameters.set_max_time_in_seconds(remaining);
+      if (options.numWorkers > 0)
+        parameters.set_num_search_workers(options.numWorkers);
+      model.Add(NewSatParameters(parameters));
+    } else if (options.numWorkers > 0) {
+      SatParameters parameters;
+      parameters.set_num_search_workers(options.numWorkers);
       model.Add(NewSatParameters(parameters));
     }
     const CpSolverResponse response = SolveCpModel(cpModel.Build(), &model);
-    if (response.status() == CpSolverStatus::INFEASIBLE)
+    if (response.status() == CpSolverStatus::INFEASIBLE) {
+      if (!balancedHintStarts.empty())
+        return containingOp->emitError(
+            "complete CP-SAT model rejected a verified balanced incumbent");
       continue;
+    }
     if (response.status() != CpSolverStatus::OPTIMAL &&
         response.status() != CpSolverStatus::FEASIBLE) {
+      if (response.status() == CpSolverStatus::UNKNOWN &&
+          !balancedHintStarts.empty())
+        return acceptBalancedIncumbent();
       if (result)
         result->status = CPSATSolveStatus::unknown;
       return containingOp->emitError("CP-SAT time limit exceeded");
@@ -522,6 +952,10 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                            ? CPSATSolveStatus::optimal
                            : CPSATSolveStatus::feasible;
       result->initiationInterval = ii;
+      result->moduloResourceModel = useCumulativeResources
+                                        ? CPSATModuloResourceModel::cumulative
+                                        : CPSATModuloResourceModel::oneHot;
+      result->phaseIndicatorCount = phaseIndicatorCount;
     }
     if (failed(prob.verify()))
       return failure();
@@ -710,4 +1144,52 @@ LogicalResult scheduling::improveModuloScheduleCPSAT(
   if (result)
     result->finalObjective = candidateObjective;
   return success();
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               ResourceCostFunction costFunction,
+                               const CPSATSchedulerOptions &options) {
+  auto schedule = [&] { return scheduleCPSAT(prob, lastOp, options); };
+  return detail::exploreResourcePareto(prob, lastOp, allocations, costFunction,
+                                       schedule, "CP-SAT");
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               const CPSATSchedulerOptions &options) {
+  auto defaultCost = [&](const ResourceAllocation &allocation) {
+    uint64_t resourceCost = 0;
+    for (const auto &entry : allocation.limits)
+      resourceCost += static_cast<uint64_t>(entry.limit) *
+                      prob.getResourceCost(entry.resource).value_or(1);
+    return resourceCost;
+  };
+  return exploreCPSATPareto(prob, lastOp, allocations, defaultCost, options);
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               ResourceCostFunction costFunction,
+                               const CPSATSchedulerOptions &options) {
+  auto schedule = [&] { return scheduleCPSAT(prob, lastOp, options); };
+  return detail::exploreResourcePareto(prob, lastOp, allocations, costFunction,
+                                       schedule, "CP-SAT");
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               const CPSATSchedulerOptions &options) {
+  auto defaultCost = [&](const ResourceAllocation &allocation) {
+    uint64_t resourceCost = 0;
+    for (const auto &entry : allocation.limits)
+      resourceCost += static_cast<uint64_t>(entry.limit) *
+                      prob.getResourceCost(entry.resource).value_or(1);
+    return resourceCost;
+  };
+  return exploreCPSATPareto(prob, lastOp, allocations, defaultCost, options);
 }

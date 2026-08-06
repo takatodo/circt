@@ -317,11 +317,14 @@ chaining-enabled modulo scheduling problem.
   a modulo reservation table. At each resource-ordering decision, a lightweight
   linear policy chooses between contending nodes; REINFORCE updates the policy
   from the final objective latency. This is episodic Monte Carlo policy-gradient
-  learning: it has no value network, temporal-difference bootstrap, replay
-  buffer, or Monte Carlo tree search. An individual pairwise choice resembles a
-  contextual-bandit action, but all choices in the schedule receive the same
-  delayed terminal reward, so they are not trained as independent bandit pulls.
-  An exponential moving-average reward is used as the REINFORCE baseline.
+  learning. Its default path has no value network, temporal-difference
+  bootstrap, replay buffer, or neural inference. An individual pairwise choice
+  resembles a contextual-bandit action, but all choices in the schedule receive
+  the same delayed terminal reward, so they are not trained as independent
+  bandit pulls. An exponential moving-average reward is used as the REINFORCE
+  baseline. An optional fixed-II MCTS rescue searches the same exact
+  difference-constraint states; it is disabled by default and does not train a
+  network.
 
   The constraint solver, rather than the policy, computes start times and
   enforces dependences. The policy only selects a disjunctive ordering when two
@@ -360,7 +363,16 @@ chaining-enabled modulo scheduling problem.
   of precedence decisions across all candidate IIs. Through `ssp-schedule`,
   select `scheduler=node-rl` and configure `episodes`,
   `episode-node-budget`, `resource-ordering-budget`, `seed`, `learning-rate`,
-  and `exploration` in the scheduler options.
+  `exploration`, and the optional `mcts-*` rescue budgets in the scheduler
+  options.
+
+  A deterministic backtracking repair is also available for clusters of at
+  most 32 nodes. Each branch owns an incremental solver snapshot, so the
+  explored-state budget alone is not a memory bound. The live DFS frontier is
+  separately capped at 64 snapshots while the 16,384-state work budget remains
+  available. On the 33-operation 2MM proxy this changed one pathological
+  resource allocation from about 1.51 GB and 1.84 seconds to about 27 MB and
+  0.03 seconds without changing its returned Pareto frontier.
 
   In an OR-Tools build, `local-search-nodes` optionally re-optimizes a bounded
   neighborhood after NodeRL finds its smallest feasible II. The neighborhood
@@ -373,13 +385,23 @@ chaining-enabled modulo scheduling problem.
   nodes because it requires OR-Tools and can add cost without helping already
   regular large schedules; it does not try a lower II.
 
-  The C++
-  `exploreNodeRLPareto` API evaluates complete resource allocations and returns
-  the non-dominated latency/implementation-cost frontier; modulo points also
-  carry their II, which participates in dominance. NodeRL emits a `bindings`
-  property for each limited operation when a static physical assignment can be
-  represented. The API's overload accepting a cost function can evaluate
-  non-linear or post-synthesis cost estimates.
+  The C++ `exploreNodeRLPareto` and `exploreCPSATPareto` APIs evaluate complete
+  resource allocations and return the non-dominated
+  latency/implementation-cost frontier; modulo points also carry their II,
+  which participates in dominance. Every returned
+  `ResourceParetoPoint` owns a schedule certificate in problem insertion order:
+  operation start times, representable static bindings, and explicit periodic
+  reservations for rotating assignments. `applyResourceParetoPoint` validates
+  the certificate against the problem and allocation, restores the selected
+  schedule, and runs the normal problem verifier without invoking a scheduler
+  again. Thus every frontier point remains materializable, including points
+  found by a stochastic policy. Missing acyclic CP-SAT bindings are
+  interval-colored deterministically. Missing modulo bindings use a greedy then
+  bounded circular coloring; when no inexpensive static coloring is found, the
+  certificate retains explicit rotating reservations instead. NodeRL emits a
+  `bindings` property for each limited operation when a static physical
+  assignment can be represented. The APIs' cost-function overloads can
+  evaluate non-linear or post-synthesis estimates.
 
   The current `bindings` property is a static operation-to-instance mapping.
   A resource hold/II longer than the pipeline II is nevertheless scheduled
@@ -387,7 +409,10 @@ chaining-enabled modulo scheduling problem.
   physical instances in successive iterations. Such a schedule deliberately
   has no static `bindings` property. Affine-to-LoopSchedule instead preserves
   the periodic request as `circt.rotating_resource_reservations` metadata on
-  the cloned operation. Each entry records `resource`, launch `phase`, pipeline
+  the cloned operation. The same path materializes assignments for start-only
+  schedulers such as CP-SAT: selector period one denotes a static allocation,
+  while a longer selector rotates across iterations. Each entry records
+  `resource`, launch `phase`, pipeline
   `period`, reservation `hold`, available `instances`, plus a verified
   `selector` table and `selector_period`. The coloring searches for the
   shortest feasible selector period and `instances` is the number of colors
@@ -403,7 +428,12 @@ chaining-enabled modulo scheduling problem.
   This lowering boundary is covered by regression tests. A recurrence with
   `limit<2>, ii<4>` and pipeline II 3 emits `selector<[0, 1]>` with selector
   period 2 and lowers to two guarded `calyx.std_mult_pipe` cells. Two operations
-  with selector sets `[0,1]` and `[2,3]` lower to a four-cell shared pool;
+  with selector sets `[0,1]` and `[2,3]` lower to a four-cell shared pool. A
+  CP-SAT schedule with multiplier hold three, pipeline II three, and limit two
+  derives period-one selectors `[0]` and `[1]` and lowers to exactly two
+  multiplier cells. That representative also passes through `calyx-native`,
+  `lower-calyx-to-hw`, `lower-seq-to-sv`, and Verilog export. This is a
+  structural realization result, not a cycle-level functional claim;
   overlapping selector sets remain rejected until completion ownership is
   carried with each request. Static `hold > 1` bindings and two operations
   sharing one static instance are also rejected: the current steady-state
@@ -552,15 +582,16 @@ chaining-enabled modulo scheduling problem.
   across ten seeds. These gains came from correcting the search space and its
   constraint representation, not from a larger policy.
 
-  A neural policy or MCTS is therefore gated rather than planned by default.
-  Measure at least ten seeds on CP-SAT-solvable clusters and introduce a small
+  Neural inference is therefore gated rather than planned by default. Measure
+  at least ten seeds on CP-SAT-solvable clusters and introduce a small
   GNN/actor-critic only if a median II or sink-latency gap above 10%, or a gap
   above 5% on at least three graph families, persists after structural fixes
   and a fixed local-search budget. Also require evidence that policy scoring,
-  rather than constraint propagation, dominates runtime. Global MCTS is not a
-  suitable first fallback because pairwise resource ordering has quadratic
-  branching and a depth proportional to the number of conflicts. If synthesis
-  later supplies a black-box area/timing reward, a 20--100-node local tree whose
+  rather than constraint propagation, dominates runtime. The implemented MCTS
+  is an opt-in, budgeted fixed-II feasibility rescue over small local states;
+  global MCTS remains unsuitable because pairwise resource ordering has
+  quadratic branching and conflict-proportional depth. If synthesis later
+  supplies a black-box area/timing reward, a 20--100-node local tree whose
   actions select a resource order or LNS neighborhood may become useful.
 
   The present evidence does not cross that gate: raw Jacobi and Covariance
@@ -581,8 +612,11 @@ chaining-enabled modulo scheduling problem.
   the designated sink start time and encodes every resource reservation phase.
   `report-statistics=true` prints both the lower bound and selected II. It is
   intended as a small-instance optimality oracle for NodeRL, not as the
-  large-graph production scheduler. CP-SAT returns reservation feasibility but
-  does not currently synthesize static resource bindings.
+  large-graph production scheduler. The low-level `scheduleCPSAT` call returns
+  reservation feasibility and start times without static bindings. The
+  `exploreCPSATPareto` wrapper turns each verified result into the same
+  replayable certificate as NodeRL, synthesizing a bounded static coloring when
+  possible and retaining rotating reservations otherwise.
 
 - Integer linear programming-based scheduler
   ([`LPSchedulers.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/LPSchedulers.cpp)):
@@ -592,10 +626,10 @@ chaining-enabled modulo scheduling problem.
 
 SSP is a problem interchange format, rather than an implementation IR. An HLS
 client should construct a `SharedOperatorsProblem` or `ModuloProblem` directly
-from its source operations, invoke `scheduleNodeRL`, and read each source
-operation's `startTime` and `resourceBindings` properties when constructing its
-own pipeline stages, control, and resource instances. For a modulo schedule it
-must additionally lower the returned pipeline II and loop-carried values. The
+from its source operations, invoke a scheduler or Pareto explorer, and read the
+selected start times, bindings, or certificate when constructing its own
+pipeline stages, control, and resource instances. For a modulo schedule it must
+additionally lower the returned pipeline II and loop-carried values. The
 client remains responsible for mapping an operator type to a typed
 implementation primitive (including operand/result widths and a module or
 Calyx primitive) and for connecting the assigned resource instance. This
@@ -607,6 +641,14 @@ synthesize the small set of returned Pareto candidates, use the measured
 area/timing/power to make the final choice, and, when appropriate, update their
 resource-cost estimates for later explorations.
 
+Keep three validation levels separate. A successful certificate replay proves
+only modeled dependences, II, resource capacity, and assignment consistency.
+Successful LoopSchedule/Calyx/HW lowering additionally proves that the selected
+resource representation is structurally accepted by that target path. Area,
+Fmax, power, routing congestion, and timing-closed throughput are PPA claims and
+must come from logic synthesis and implementation; neither the linear resource
+cost nor a verified schedule predicts them by itself.
+
 For the existing Affine demonstration flow, pass
 `-convert-affine-to-loopschedule="scheduler=node-rl"` selects Modulo NodeRL
 instead of the default simplex scheduler; `scheduler=cpsat` selects the exact
@@ -614,10 +656,23 @@ reference solver in an OR-Tools-enabled build. Both lower the resulting
 II/start times to `loopschedule.pipeline`; `node-rl-episodes`,
 `node-rl-episode-node-budget`, `node-rl-resource-ordering-budget`, and
 `node-rl-seed` control the reproducible NodeRL search.
+`node-rl-mcts-trees`, `node-rl-mcts-simulations`, the tree/rollout widths, and
+the MCTS time limit enable the otherwise-disabled fixed-II rescue.
 `node-rl-local-search-nodes` and `node-rl-local-search-time-limit` enable the
 optional OR-Tools neighborhood. With `multiplier-limit=N` and
 `multiplier-ii=H`, the flow also models N shared multiplier instances with a
-hold/accept interval of H cycles and preserves static bindings as metadata.
+  hold/accept interval of H cycles and preserves static bindings as metadata.
+  If CP-SAT returns only start times, the flow derives a periodic selector;
+  selector period one is an ordinary static assignment.
+For direct Affine CP-SAT experiments, `cpsat-time-limit`, `cpsat-workers`,
+`cpsat-minimize-latency`, `cpsat-resource-model`, `cpsat-balanced-probe`, and
+`cpsat-balanced-probe-time-limit` forward the corresponding exact-scheduler
+controls. `cpsat-report-statistics` reports the proved lower bound, selected
+II, effective resource model, and probe result.
+`emit-ssp` prints the unscheduled problem produced by Affine dependence
+analysis as a standalone SSP instance and skips LoopSchedule conversion. This
+is intended for scheduler experiments that must round-trip through CIRCT's
+strict problem verifier.
 LoopSchedule-to-Calyx consumes a single-owner static binding and the
 rotating selectors described above. It accepts cross-operation pools only when
 their selected physical instance sets are disjoint; overlapping ownership

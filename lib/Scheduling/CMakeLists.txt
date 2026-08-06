@@ -5,6 +5,7 @@ set(LLVM_OPTIONAL_SOURCES
   LPSchedulers.cpp
   NodeRLScheduler.cpp
   Problems.cpp
+  ResourceSchedule.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
   )
@@ -14,6 +15,7 @@ set(SCHEDULING_SOURCES
   ChainingSupport.cpp
   NodeRLScheduler.cpp
   Problems.cpp
+  ResourceSchedule.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
   )

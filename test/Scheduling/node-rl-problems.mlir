@@ -324,3 +324,35 @@ ssp.instance @coupled_multi_resource_bulk_ordering of "ModuloProblem" {
     operation<@sink> @last(%j0, %j1)
   }
 }
+
+// The minimum-II resource order crosses the modulo boundary: @early is
+// followed in phase order by @late0/@late1 before returning to @middle0. A
+// nearest-conflict-only repair cannot construct that cyclic order, even though
+// the dependence graph itself is acyclic.
+// CHECK-LABEL: @wrapped_resource_order
+// CHECK-SAME: [II<15>]
+ssp.instance @wrapped_resource_order of "ModuloProblem" {
+  library {
+    operator_type @lat1 [latency<1>]
+    operator_type @lat2 [latency<2>]
+    operator_type @lat3 [latency<3>]
+    operator_type @sink [latency<1>]
+  }
+  resource {
+    resource_type @r0 [limit<2>, ii<2>]
+    resource_type @r1 [limit<1>, ii<3>]
+  }
+  graph {
+    %early = operation<@lat3> @early() uses[@r0, @r1]
+    %bridge0 = operation<@lat2>(%early) uses[@r0]
+    %bridge1 = operation<@lat2>(%bridge0) uses[@r0]
+    %bridge2 = operation<@lat1>(%bridge1) uses[@r0]
+    %middle0 = operation<@lat3>(%bridge2) uses[@r1]
+    %middle1 = operation<@lat3>(%middle0) uses[@r1]
+    %late0 = operation<@lat1> @late0(%middle1) uses[@r1]
+    %late1 = operation<@lat2> @late1(%late0) uses[@r1]
+    // CHECK: operation<@sink> @last({{.*}}) [t<23>]
+    operation<@sink> @last(%early, %bridge0, %bridge1, %bridge2,
+                              %middle0, %middle1, %late0, %late1)
+  }
+}

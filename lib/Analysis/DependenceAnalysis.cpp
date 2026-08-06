@@ -160,10 +160,14 @@ circt::analysis::MemoryDependenceAnalysis::getDependences(Operation *op) {
 void circt::analysis::MemoryDependenceAnalysis::replaceOp(Operation *oldOp,
                                                           Operation *newOp) {
   // If oldOp had any dependences.
-  auto it = results.find(oldOp);
-  if (it != results.end())
-    // Move the dependences to newOp.
-    it->first = newOp;
+  if (auto it = results.find(oldOp); it != results.end()) {
+    // Move the dependences to newOp. DenseMap keys cannot be changed in place:
+    // doing so leaves the entry in the bucket selected for oldOp and makes a
+    // later lookup by newOp fail.
+    auto dependences = std::move(it->second);
+    results.erase(it);
+    results[newOp] = std::move(dependences);
+  }
 
   // Find any dependences originating from oldOp and make newOp the source.
   // TODO(mikeurbach): consider adding an inverted index to avoid this scan.

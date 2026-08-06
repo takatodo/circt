@@ -35,6 +35,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cassert>
+#include <cmath>
 #include <limits>
 
 #define DEBUG_TYPE "affine-to-loopschedule"
@@ -62,10 +63,126 @@ static constexpr StringLiteral resourceBindingsAttrName =
 static constexpr StringLiteral rotatingReservationsAttrName =
     "circt.rotating_resource_reservations";
 
-/// Build a periodic instance-selection table for one resource. The table is
-/// represented by one color per operation and iteration class. It is only
-/// applicable when every use of the resource is rotating; mixing this scheme
-/// with pre-existing static bindings needs a combined allocator.
+/// Print a self-contained SSP instance for an Affine scheduling problem.  Use
+/// synthetic SSA results and auxiliary dependences so block arguments and
+/// result-less source operations do not leak out of the scheduling graph.
+static void printAsSSP(ModuloProblem &problem, Operation *anchor,
+                       unsigned instanceIndex) {
+  raw_ostream &os = llvm::errs();
+  DenseMap<Operation *, unsigned> operationIndices;
+  for (auto [index, operation] : llvm::enumerate(problem.getOperations()))
+    operationIndices[operation] = index;
+
+  auto printSymbol = [&](StringAttr name) {
+    FlatSymbolRefAttr::get(name).print(os);
+  };
+  auto printOperationName = [&](Operation *operation) {
+    if (operation == anchor)
+      os << "@last";
+    else
+      os << "@op" << operationIndices.lookup(operation);
+  };
+
+  os << "// ----- BEGIN AFFINE MODULO SSP -----\n";
+  os << "ssp.instance @affine_modulo_" << instanceIndex
+     << " of \"ModuloProblem\" {\n";
+  os << "  library {\n";
+  for (auto operatorType : problem.getOperatorTypes()) {
+    os << "    operator_type ";
+    printSymbol(operatorType.getAttr());
+    os << " [latency<" << problem.getLatency(operatorType).value_or(0)
+       << ">]\n";
+  }
+  os << "  }\n";
+  os << "  resource {\n";
+  for (auto resourceType : problem.getResourceTypes()) {
+    unsigned limit = problem.getLimit(resourceType).value_or(0);
+    if (limit == 0)
+      continue;
+    os << "    resource_type ";
+    printSymbol(resourceType.getAttr());
+    os << " [limit<" << limit << ">, ii<"
+       << problem.getResourceInitiationInterval(resourceType).value_or(1)
+       << ">]\n";
+  }
+  os << "  }\n";
+  os << "  graph {\n";
+  for (Operation *operation : problem.getOperations()) {
+    unsigned index = operationIndices.lookup(operation);
+    os << "    ";
+    if (operation != anchor)
+      os << "%op" << index << " = ";
+    os << "operation<";
+    printSymbol(problem.getLinkedOperatorType(operation)->getAttr());
+    os << "> ";
+    printOperationName(operation);
+    os << "(";
+    bool first = true;
+    for (auto dependence : problem.getDependences(operation)) {
+      if (!first)
+        os << ", ";
+      first = false;
+      Operation *source = dependence.getSource();
+      assert(operationIndices.contains(source) &&
+             "dependence source is outside the scheduling problem");
+      printOperationName(source);
+      if (unsigned distance = problem.getDistance(dependence).value_or(0))
+        os << " [dist<" << distance << ">]";
+    }
+    os << ")";
+    SmallVector<Problem::ResourceType> limitedResources;
+    if (auto resources = problem.getLinkedResourceTypes(operation))
+      for (auto resourceType : *resources)
+        if (problem.getLimit(resourceType).value_or(0) > 0)
+          limitedResources.push_back(resourceType);
+    if (!limitedResources.empty()) {
+      os << " uses[";
+      llvm::interleaveComma(limitedResources, os, [&](auto resourceType) {
+        printSymbol(resourceType.getAttr());
+      });
+      os << "]";
+    }
+    os << "\n";
+  }
+  os << "  }\n";
+  os << "}\n";
+  os << "// ----- END AFFINE MODULO SSP -----\n";
+}
+
+#ifdef SCHEDULING_OR_TOOLS
+static StringRef getCPSATStatusName(CPSATSolveStatus status) {
+  switch (status) {
+  case CPSATSolveStatus::optimal:
+    return "optimal";
+  case CPSATSolveStatus::feasible:
+    return "feasible";
+  case CPSATSolveStatus::infeasible:
+    return "infeasible";
+  case CPSATSolveStatus::unknown:
+    return "unknown";
+  }
+  llvm_unreachable("unknown CP-SAT solve status");
+}
+
+static StringRef
+getCPSATResourceModelName(CPSATModuloResourceModel resourceModel) {
+  switch (resourceModel) {
+  case CPSATModuloResourceModel::autoSelect:
+    return "auto";
+  case CPSATModuloResourceModel::oneHot:
+    return "onehot";
+  case CPSATModuloResourceModel::cumulative:
+    return "cumulative";
+  }
+  llvm_unreachable("unknown CP-SAT resource model");
+}
+#endif
+
+/// Build a periodic instance-selection table for one unbound resource. The
+/// table is represented by one color per operation and iteration class. A
+/// selector period of one is a static allocation; longer periods rotate the
+/// selected instance between loop iterations. Mixing this scheme with
+/// pre-existing static bindings needs a combined allocator.
 struct RotatingSelectorAllocation {
   DenseMap<Operation *, SmallVector<unsigned>> selectors;
   unsigned instances = 0;
@@ -77,7 +194,7 @@ buildRotatingSelectorTable(ModuloProblem &problem,
   unsigned instanceLimit = problem.getLimit(resource).value_or(0);
   unsigned period = *problem.getInitiationInterval();
   unsigned hold = problem.getResourceInitiationInterval(resource).value_or(1);
-  if (instanceLimit == 0 || hold <= period)
+  if (instanceLimit == 0)
     return std::nullopt;
 
   SmallVector<Operation *> users;
@@ -206,7 +323,7 @@ ModuloProblem AffineToLoopSchedule::getModuloProblem(CyclicProblem &prob) {
 
 void AffineToLoopSchedule::runOnOperation() {
   // Get dependence analysis for the whole function.
-  auto dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
+  auto &dependenceAnalysis = getAnalysis<MemoryDependenceAnalysis>();
 
   // After dependence analysis, materialize affine structures.
   if (failed(lowerAffineStructures(dependenceAnalysis)))
@@ -217,6 +334,7 @@ void AffineToLoopSchedule::runOnOperation() {
 
   // Collect perfectly nested loops and work on them.
   auto outerLoops = getOperation().getOps<AffineForOp>();
+  unsigned instanceIndex = 0;
   for (auto root : llvm::make_early_inc_range(outerLoops)) {
     SmallVector<AffineForOp> nestedLoops;
     getPerfectlyNestedLoops(nestedLoops, root);
@@ -231,6 +349,14 @@ void AffineToLoopSchedule::runOnOperation() {
     // Populate the target operator types.
     if (failed(populateOperatorTypes(nestedLoops, moduloProblem)))
       return signalPassFailure();
+
+    if (emitSSP) {
+      if (failed(moduloProblem.check()))
+        return signalPassFailure();
+      printAsSSP(moduloProblem, nestedLoops.back().getBody()->getTerminator(),
+                 instanceIndex++);
+      continue;
+    }
 
     // Solve the scheduling problem computed by the analysis.
     if (failed(solveSchedulingProblem(nestedLoops, moduloProblem)))
@@ -507,6 +633,11 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
     options.episodes = nodeRLEpisodes;
     options.episodeNodeBudget = nodeRLEpisodeNodeBudget;
     options.resourceOrderingBudget = nodeRLResourceOrderingBudget;
+    options.mctsRescueTrees = nodeRLMCTSTrees;
+    options.mctsRescueSimulations = nodeRLMCTSSimulations;
+    options.mctsTreeWidth = nodeRLMCTSTreeWidth;
+    options.mctsRolloutWidth = nodeRLMCTSRolloutWidth;
+    options.mctsTimeLimitSeconds = nodeRLMCTSTimeLimit;
     options.localSearchNodes = nodeRLLocalSearchNodes;
     options.localSearchTimeLimitSeconds = nodeRLLocalSearchTimeLimit;
     options.seed = nodeRLSeed;
@@ -514,8 +645,50 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
       return failure();
 #ifdef SCHEDULING_OR_TOOLS
   } else if (scheduler == "cpsat") {
-    if (failed(scheduleCPSAT(problem, anchor)))
+    double timeLimit = cpsatTimeLimit;
+    double balancedProbeTimeLimit = cpsatBalancedProbeTimeLimit;
+    if (!std::isfinite(timeLimit) || timeLimit < 0.0)
+      return forOp.emitError("invalid cpsat-time-limit; expected a finite "
+                             "non-negative number");
+    if (!std::isfinite(balancedProbeTimeLimit) || balancedProbeTimeLimit <= 0.0)
+      return forOp.emitError("invalid cpsat-balanced-probe-time-limit; "
+                             "expected a finite positive number");
+
+    CPSATModuloResourceModel resourceModel;
+    if (cpsatResourceModel == "auto")
+      resourceModel = CPSATModuloResourceModel::autoSelect;
+    else if (cpsatResourceModel == "onehot")
+      resourceModel = CPSATModuloResourceModel::oneHot;
+    else if (cpsatResourceModel == "cumulative")
+      resourceModel = CPSATModuloResourceModel::cumulative;
+    else
+      return forOp.emitError("invalid cpsat-resource-model; expected auto, "
+                             "onehot, or cumulative");
+
+    CPSATSchedulerOptions options;
+    options.timeLimitSeconds = timeLimit;
+    options.numWorkers = cpsatWorkers;
+    options.minimizeLatency = cpsatMinimizeLatency;
+    options.enableBalancedProbe = cpsatBalancedProbe;
+    options.balancedProbeTimeLimitSeconds = balancedProbeTimeLimit;
+    options.moduloResourceModel = resourceModel;
+    CPSATSchedulerResult result;
+    if (failed(scheduleCPSAT(problem, anchor, options, &result)))
       return failure();
+    if (cpsatReportStatistics)
+      llvm::errs() << "affine-cpsat: status="
+                   << getCPSATStatusName(result.status)
+                   << ", lower-bound=" << result.lowerBound
+                   << ", II=" << result.initiationInterval
+                   << ", resource-model="
+                   << getCPSATResourceModelName(result.moduloResourceModel)
+                   << ", phase-indicators=" << result.phaseIndicatorCount
+                   << ", balanced-probe="
+                   << (!options.enableBalancedProbe    ? "off"
+                       : result.balancedProbeSucceeded ? "hit"
+                       : result.balancedProbeAttempted ? "miss"
+                                                       : "skipped")
+                   << "\n";
 #endif
   } else {
     return forOp.emitError() << "unsupported modulo scheduler '" << scheduler
@@ -600,8 +773,8 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   }
 
   // Compute each cyclic selector table once. Besides avoiding repeated graph
-  // coloring for every operation, this also distinguishes a real rotating
-  // allocation from the ordinary "no static binding metadata" case.
+  // coloring for every operation, this materializes an implementable instance
+  // selection for schedulers such as CP-SAT that only return start times.
   DenseMap<Problem::ResourceType, RotatingSelectorAllocation>
       rotatingSelectorTables;
   DenseSet<Problem::ResourceType> visitedResources;
