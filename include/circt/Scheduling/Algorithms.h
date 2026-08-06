@@ -179,6 +179,48 @@ improveModuloScheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                            const CPSATModuloLocalSearchOptions &options = {},
                            CPSATModuloLocalSearchResult *result = nullptr);
 
+/// Configuration for the node-level reinforcement-learning scheduler.
+///
+/// The scheduler trains a lightweight linear policy directly on the problem
+/// instance. For acyclic problems the policy selects one ready operation from
+/// the dependence graph. For modulo problems it selects an ordering between
+/// operations whose periodic resource reservations conflict. The terminal
+/// reward is based on the start time of `lastOp`. A fixed seed makes training
+/// reproducible.
+struct NodeRLSchedulerOptions {
+  /// Maximum number of policy-training episodes per candidate II.
+  unsigned episodes = 64;
+
+  /// Stop a modulo search after this many node-episodes pass without improving
+  /// the best result. The effective patience is this budget divided by the
+  /// graph's node count, with a minimum of eight episodes. Zero disables
+  /// adaptive stopping.
+  unsigned episodeNodeBudget = 65536;
+
+  /// Maximum number of resource-ordering constraints considered across all
+  /// candidate IIs and episodes. Reaching the limit stops training when a
+  /// feasible result is already available and otherwise reports failure. Zero
+  /// disables the limit.
+  unsigned resourceOrderingBudget = 1048576;
+
+  /// Re-optimize this many operations around the modulo objective with a
+  /// bounded CP-SAT neighborhood after NodeRL finds its smallest feasible II.
+  /// Zero disables local search. This requires an OR-Tools-enabled build.
+  unsigned localSearchNodes = 0;
+
+  /// Wall-clock limit for the optional CP-SAT neighborhood improvement.
+  double localSearchTimeLimitSeconds = 0.1;
+
+  /// Seed for sampling actions from the policy.
+  uint64_t seed = 0;
+
+  /// Step size used by the REINFORCE policy update.
+  double learningRate = 0.05;
+
+  /// Initial softmax temperature. Higher values explore more actions.
+  double exploration = 1.0;
+};
+
 /// A requested number of instances for one resource type.
 struct ResourceLimit {
   Problem::ResourceType resource;
@@ -276,6 +318,47 @@ exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
                    ArrayRef<ResourceAllocation> allocations,
                    ResourceCostFunction costFunction,
                    const CPSATSchedulerOptions &options = {});
+
+/// Solve an acyclic resource-constrained problem using node-level
+/// reinforcement learning. The scheduler learns a priority policy over ready
+/// operations and retains the best feasible schedule seen during training. It
+/// supports operations linked to multiple limited resources.
+LogicalResult scheduleNodeRL(SharedOperatorsProblem &prob, Operation *lastOp,
+                             const NodeRLSchedulerOptions &options = {});
+
+/// Solve a modulo scheduling problem using node-level reinforcement learning.
+/// The scheduler searches increasing initiation intervals, satisfies loop-
+/// carried dependences as cyclic difference constraints, and resolves resource
+/// conflicts with a modulo reservation table.
+LogicalResult scheduleNodeRL(ModuloProblem &prob, Operation *lastOp,
+                             const NodeRLSchedulerOptions &options = {});
+
+/// Schedule each complete resource allocation with NodeRL and return the
+/// latency/resource-cost Pareto frontier.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreNodeRLPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                    ArrayRef<ResourceAllocation> allocations,
+                    const NodeRLSchedulerOptions &options = {});
+
+/// As above, but use a client-provided cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreNodeRLPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                    ArrayRef<ResourceAllocation> allocations,
+                    ResourceCostFunction costFunction,
+                    const NodeRLSchedulerOptions &options = {});
+
+/// Modulo-scheduling variant of the NodeRL Pareto exploration.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreNodeRLPareto(ModuloProblem &prob, Operation *lastOp,
+                    ArrayRef<ResourceAllocation> allocations,
+                    const NodeRLSchedulerOptions &options = {});
+
+/// As above, but use a client-provided cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreNodeRLPareto(ModuloProblem &prob, Operation *lastOp,
+                    ArrayRef<ResourceAllocation> allocations,
+                    ResourceCostFunction costFunction,
+                    const NodeRLSchedulerOptions &options = {});
 
 } // namespace scheduling
 } // namespace circt

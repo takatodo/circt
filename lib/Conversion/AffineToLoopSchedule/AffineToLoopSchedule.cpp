@@ -533,6 +533,16 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
   if (scheduler == "simplex") {
     if (failed(scheduleSimplex(problem, anchor)))
       return failure();
+  } else if (scheduler == "node-rl") {
+    NodeRLSchedulerOptions options;
+    options.episodes = nodeRLEpisodes;
+    options.episodeNodeBudget = nodeRLEpisodeNodeBudget;
+    options.resourceOrderingBudget = nodeRLResourceOrderingBudget;
+    options.localSearchNodes = nodeRLLocalSearchNodes;
+    options.localSearchTimeLimitSeconds = nodeRLLocalSearchTimeLimit;
+    options.seed = nodeRLSeed;
+    if (failed(scheduleNodeRL(problem, anchor, options)))
+      return failure();
 #ifdef SCHEDULING_OR_TOOLS
   } else if (scheduler == "cpsat") {
     double timeLimit = cpsatTimeLimit;
@@ -582,9 +592,9 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
 #endif
   } else {
     return forOp.emitError() << "unsupported modulo scheduler '" << scheduler
-                             << "'; expected 'simplex'"
+                             << "'; expected 'simplex', 'node-rl'"
 #ifdef SCHEDULING_OR_TOOLS
-                             << " or 'cpsat'";
+                             << ", or 'cpsat'";
 #else
                              << " (or 'cpsat' in an OR-Tools build)";
 #endif

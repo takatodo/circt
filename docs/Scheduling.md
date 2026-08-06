@@ -313,6 +313,21 @@ chaining-enabled modulo scheduling problem.
   multi-cycle resource reservations. Its one-hot and cumulative encodings are
   exact alternatives; `auto` selects the cumulative encoding for large phase
   expansions.
+- Node-level policy scheduler
+  ([`NodeRLScheduler.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/NodeRLScheduler.cpp)):
+  Trains a lightweight linear REINFORCE policy on one problem instance. The
+  acyclic variant selects ready operations; the modulo variant learns ordering
+  decisions between conflicting periodic resource reservations while a
+  difference-constraint solver enforces loop-carried dependences. No neural
+  network, offline model, or GPU is required. The scheduler is heuristic: it
+  retains the best verified schedule seen within its episode and work budgets.
+
+The `node-rl` SSP scheduler accepts `episodes`, `episode-node-budget`,
+`resource-ordering-budget`, `seed`, `learning-rate`, and `exploration` options.
+An OR-Tools build can additionally apply bounded CP-SAT neighborhood
+improvement with `local-search-nodes` and `local-search-time-limit`.
+`convert-affine-to-loopschedule` exposes corresponding `node-rl-*` options and
+can model a shared multiplier with `multiplier-limit` and `multiplier-ii`.
 
 ### Replayable resource schedules
 

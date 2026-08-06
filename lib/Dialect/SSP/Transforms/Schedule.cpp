@@ -67,6 +67,88 @@ static std::optional<float> getCycleTime(StringRef options) {
   return std::nullopt;
 }
 
+static FailureOr<NodeRLSchedulerOptions> getNodeRLOptions(InstanceOp instOp,
+                                                          StringRef options) {
+  NodeRLSchedulerOptions result;
+  for (StringRef option : llvm::split(options, ',')) {
+    option = option.trim();
+    if (option.empty() || option.consume_front("last-op-name="))
+      continue;
+    if (option.consume_front("episodes=")) {
+      if (option.getAsInteger(10, result.episodes) || result.episodes == 0) {
+        instOp.emitError(
+            "invalid node-rl 'episodes' option; expected a positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("episode-node-budget=")) {
+      if (option.getAsInteger(10, result.episodeNodeBudget)) {
+        instOp.emitError("invalid node-rl 'episode-node-budget' option; "
+                         "expected an unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("resource-ordering-budget=")) {
+      if (option.getAsInteger(10, result.resourceOrderingBudget)) {
+        instOp.emitError("invalid node-rl 'resource-ordering-budget' option; "
+                         "expected an unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("local-search-nodes=")) {
+      if (option.getAsInteger(10, result.localSearchNodes)) {
+        instOp.emitError("invalid node-rl 'local-search-nodes' option; "
+                         "expected an unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("local-search-time-limit=")) {
+      if (option.getAsDouble(result.localSearchTimeLimitSeconds) ||
+          !std::isfinite(result.localSearchTimeLimitSeconds) ||
+          result.localSearchTimeLimitSeconds <= 0.0) {
+        instOp.emitError("invalid node-rl 'local-search-time-limit' option; "
+                         "expected a finite positive number");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("seed=")) {
+      if (option.getAsInteger(10, result.seed)) {
+        instOp.emitError(
+            "invalid node-rl 'seed' option; expected an unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("learning-rate=")) {
+      if (option.getAsDouble(result.learningRate) ||
+          !std::isfinite(result.learningRate) || result.learningRate <= 0.0) {
+        instOp.emitError("invalid node-rl 'learning-rate' option; expected a "
+                         "finite positive number");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("exploration=")) {
+      if (option.getAsDouble(result.exploration) ||
+          !std::isfinite(result.exploration) || result.exploration <= 0.0) {
+        instOp.emitError("invalid node-rl 'exploration' option; expected a "
+                         "finite positive number");
+        return failure();
+      }
+      continue;
+    }
+
+    instOp.emitError() << "unknown node-rl scheduler option '" << option << "'";
+    return failure();
+  }
+  return result;
+}
+
 struct CPSATPassOptions {
   CPSATSchedulerOptions scheduler;
   bool reportStatistics = false;
@@ -208,6 +290,50 @@ static InstanceOp scheduleWithASAP(InstanceOp instOp, OpBuilder &builder) {
 
   auto prob = loadProblem<Problem>(instOp);
   if (failed(prob.check()) || failed(scheduling::scheduleASAP(prob)) ||
+      failed(prob.verify()))
+    return {};
+  return saveProblem(prob, builder);
+}
+
+//===----------------------------------------------------------------------===//
+// Node-level reinforcement-learning scheduler
+//===----------------------------------------------------------------------===//
+
+static InstanceOp scheduleWithNodeRL(InstanceOp instOp, StringRef options,
+                                     OpBuilder &builder) {
+  auto lastOp = getLastOp(instOp, options);
+  if (!lastOp) {
+    auto instName = instOp.getSymName().value_or("unnamed");
+    llvm::errs() << "ssp-schedule: Ambiguous objective for node-rl scheduler: "
+                    "Instance '"
+                 << instName << "' has no designated last operation\n";
+    return {};
+  }
+
+  auto problemName = instOp.getProblemName();
+  if (problemName != "SharedOperatorsProblem" &&
+      problemName != "ModuloProblem") {
+    llvm::errs() << "ssp-schedule: Unsupported problem '" << problemName
+                 << "' for node-rl scheduler\n";
+    return {};
+  }
+
+  auto parsedOptions = getNodeRLOptions(instOp, options);
+  if (failed(parsedOptions))
+    return {};
+
+  if (problemName == "SharedOperatorsProblem") {
+    auto prob = loadProblem<SharedOperatorsProblem>(instOp);
+    if (failed(prob.check()) ||
+        failed(scheduling::scheduleNodeRL(prob, lastOp, *parsedOptions)) ||
+        failed(prob.verify()))
+      return {};
+    return saveProblem(prob, builder);
+  }
+
+  auto prob = loadProblem<ModuloProblem>(instOp);
+  if (failed(prob.check()) ||
+      failed(scheduling::scheduleNodeRL(prob, lastOp, *parsedOptions)) ||
       failed(prob.verify()))
     return {};
   return saveProblem(prob, builder);
@@ -408,6 +534,8 @@ static InstanceOp scheduleWith(InstanceOp instOp, StringRef scheduler,
     return scheduleWithSimplex(instOp, options, builder);
   if (scheduler == "asap")
     return scheduleWithASAP(instOp, builder);
+  if (scheduler == "node-rl" || scheduler == "rl")
+    return scheduleWithNodeRL(instOp, options, builder);
 #ifdef SCHEDULING_OR_TOOLS
   if (scheduler == "lp")
     return scheduleWithLP(instOp, options, builder);
