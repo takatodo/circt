@@ -143,14 +143,14 @@ func.func @dot_shared_mem(%arg0: memref<128xi32>) -> i32 {
   // CHECK: loopschedule.pipeline II = 2
   // First stage.
   // CHECK: %[[STAGE0:.+]]:3 = loopschedule.pipeline.stage
-  // CHECK-DAG: %[[STAGE0_0:.+]] = memref.load %arg0[%arg1] : memref<128xi32>
+  // CHECK-DAG: %[[STAGE0_0:.+]] = memref.load %arg0[%arg1]{{.*}} : memref<128xi32>
   // CHECK-DAG: %[[STAGE0_1:.+]] = arith.addi %arg1, %c64 : index
   // CHECK-DAG: %[[STAGE0_2:.+]] = arith.addi %arg1, %c1 : index
   // CHECK: loopschedule.register %[[STAGE0_0]], %[[STAGE0_1]], %[[STAGE0_2]]
 
   // Second stage.
   // CHECK: %[[STAGE1:.+]]:2 = loopschedule.pipeline.stage
-  // CHECK: %[[STAGE1_0:.+]] = memref.load %arg0[%[[STAGE0]]#1] : memref<128xi32>
+  // CHECK: %[[STAGE1_0:.+]] = memref.load %arg0[%[[STAGE0]]#1]{{.*}} : memref<128xi32>
   // CHECK: loopschedule.register %[[STAGE0]]#0, %[[STAGE1_0]]
 
   // Third stage.

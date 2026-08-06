@@ -27,7 +27,9 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <type_traits>
 #include <variant>
@@ -155,6 +157,17 @@ public:
     return pipelinePrologue[op];
   }
 
+  /// Add an initialization group discovered after BuildWhileGroups has
+  /// created the pipeline scheduleable. Rotating resource selectors use this
+  /// to reset their phase at every pipeline invocation.
+  void addAdditionalPipelineInitGroup(Operation *op, calyx::GroupOp group) {
+    additionalPipelineInitGroups[op].push_back(group);
+  }
+
+  SmallVector<calyx::GroupOp> getAdditionalPipelineInitGroups(Operation *op) {
+    return additionalPipelineInitGroups[op];
+  }
+
   /// Create the pipeline prologue.
   void createPipelinePrologue(Operation *op, PatternRewriter &rewriter) {
     auto stages = pipelinePrologue[op];
@@ -199,6 +212,10 @@ private:
   /// constitute the pipeline epilogue. Each inner vector consists of the groups
   /// for one stage.
   DenseMap<Operation *, SmallVector<SmallVector<StringAttr>>> pipelineEpilogue;
+
+  /// Initialization groups created after the base loop iter-arg groups.
+  DenseMap<Operation *, SmallVector<calyx::GroupOp>>
+      additionalPipelineInitGroups;
 };
 
 /// Handles the current state of lowering of a Calyx component. It is mainly
@@ -211,6 +228,30 @@ class ComponentLoweringState
 public:
   ComponentLoweringState(calyx::ComponentOp component)
       : calyx::ComponentLoweringStateInterface(component) {}
+
+  calyx::MultPipeLibOp getOrCreateSharedMultiplier(StringRef key,
+                                                   OpBuilder &builder,
+                                                   Location loc, Type width,
+                                                   Type one) {
+    if (auto it = sharedMultipliers.find(key); it != sharedMultipliers.end())
+      return it->second;
+    auto multiplier = getNewLibraryOpInstance<calyx::MultPipeLibOp>(
+        builder, loc, {one, one, one, width, width, width, one});
+    sharedMultipliers.try_emplace(key, multiplier);
+    return multiplier;
+  }
+
+  /// The current dynamic groups can safely route a completion only when one
+  /// source operation owns the physical instance. Distinct rotating operations
+  /// may share a resource pool when their selector sets are disjoint.
+  bool claimResourceInstance(StringRef key, Operation *op) {
+    auto [it, inserted] = resourceInstanceOwners.try_emplace(key, op);
+    return inserted || it->second == op;
+  }
+
+private:
+  StringMap<calyx::MultPipeLibOp> sharedMultipliers;
+  StringMap<Operation *> resourceInstanceOwners;
 };
 
 //===----------------------------------------------------------------------===//
@@ -286,6 +327,8 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
+  LogicalResult buildRotatingMultiplier(PatternRewriter &rewriter, MulIOp op,
+                                        ArrayAttr reservations) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         LoopScheduleTerminatorOp op) const;
 
@@ -365,11 +408,15 @@ private:
     StringRef opName = TSrcOp::getOperationName().split(".").second;
     Location loc = op.getLoc();
     Type width = op.getResult().getType();
-    // Pass the result from the Operation to the Calyx primitive.
-    op.getResult().replaceAllUsesWith(out);
     auto reg = createRegister(
         op.getLoc(), rewriter, getComponent(), width.getIntOrFloatBitWidth(),
         getState<ComponentLoweringState>().getUniqueName(opName));
+    // Each source operation needs an identity distinct from the library
+    // primitive output. This matters when multiple, non-overlapping operations
+    // share one pipelined primitive: they all observe the same `out` port, but
+    // each operation writes a different temporary register and therefore owns
+    // a different Calyx group.
+    op.getResult().replaceAllUsesWith(reg.getOut());
     // Operation pipelines are not combinational, so a GroupOp is required.
     auto group = createGroupForOp<calyx::GroupOp>(rewriter, op);
     getState<ComponentLoweringState>().addBlockScheduleable(op->getBlock(),
@@ -389,7 +436,8 @@ private:
     calyx::GroupDoneOp::create(rewriter, loc, reg.getDone());
 
     // Register the values for the pipeline.
-    getState<ComponentLoweringState>().registerEvaluatingGroup(out, group);
+    getState<ComponentLoweringState>().registerEvaluatingGroup(reg.getOut(),
+                                                               group);
     getState<ComponentLoweringState>().registerEvaluatingGroup(opPipe.getLeft(),
                                                                group);
     getState<ComponentLoweringState>().registerEvaluatingGroup(
@@ -515,14 +563,229 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   return success();
 }
 
+LogicalResult
+BuildOpGroups::buildRotatingMultiplier(PatternRewriter &rewriter, MulIOp mul,
+                                       ArrayAttr reservations) const {
+  if (reservations.size() != 1)
+    return mul.emitError(
+        "expected exactly one rotating reservation on an integer multiply");
+
+  auto reservation = dyn_cast<DictionaryAttr>(reservations[0]);
+  if (!reservation)
+    return mul.emitError("expected a dictionary rotating reservation");
+
+  auto resource = dyn_cast_or_null<StringAttr>(reservation.get("resource"));
+  auto instances = dyn_cast_or_null<IntegerAttr>(reservation.get("instances"));
+  auto selector = dyn_cast_or_null<ArrayAttr>(reservation.get("selector"));
+  auto selectorPeriod =
+      dyn_cast_or_null<IntegerAttr>(reservation.get("selector_period"));
+  auto period = dyn_cast_or_null<IntegerAttr>(reservation.get("period"));
+  auto hold = dyn_cast_or_null<IntegerAttr>(reservation.get("hold"));
+  if (!resource || !instances || !selector || !selectorPeriod || !period ||
+      !hold)
+    return mul.emitError("incomplete rotating multiplier reservation metadata");
+  if (resource.getValue() != "multiplier")
+    return mul.emitError() << "unsupported rotating resource '"
+                           << resource.getValue() << "'";
+  if (instances.getInt() <= 0 || selectorPeriod.getInt() <= 0 ||
+      period.getInt() <= 0 || hold.getInt() <= 0)
+    return mul.emitError(
+        "rotating reservation counts and periods must be positive");
+  if (selector.size() != static_cast<size_t>(selectorPeriod.getInt()))
+    return mul.emitError("rotating selector length must equal selector_period");
+
+  SmallVector<unsigned> selectorValues;
+  selectorValues.reserve(selector.size());
+  for (Attribute attr : selector) {
+    auto value = dyn_cast<IntegerAttr>(attr);
+    if (!value || value.getInt() < 0 || value.getInt() >= instances.getInt())
+      return mul.emitError(
+          "rotating selector contains an invalid resource instance");
+    selectorValues.push_back(value.getInt());
+  }
+
+  auto pipeline = mul->getParentOfType<LoopSchedulePipelineOp>();
+  if (!pipeline)
+    return mul.emitError(
+        "rotating multiplier reservation requires a LoopSchedule pipeline");
+
+  auto &state = getState<ComponentLoweringState>();
+  Location loc = mul.getLoc();
+  Type width = mul.getResult().getType();
+  Type one = rewriter.getI1Type();
+  unsigned bitWidth = width.getIntOrFloatBitWidth();
+  Value trueValue =
+      createConstant(loc, rewriter, getComponent(), 1, 1).getResult();
+
+  SmallVector<unsigned> selectedInstances;
+  for (unsigned instance : selectorValues)
+    if (!llvm::is_contained(selectedInstances, instance))
+      selectedInstances.push_back(instance);
+
+  SmallVector<calyx::MultPipeLibOp> multipliers(instances.getInt());
+  for (unsigned instance : selectedInstances) {
+    std::string key = resource.getValue().str() + "." +
+                      std::to_string(instance) + "." + std::to_string(bitWidth);
+    if (!state.claimResourceInstance(key, mul))
+      return mul.emitError()
+             << "rotating multiplier instance '" << resource.getValue() << "."
+             << instance << "' is selected by multiple operations and "
+             << "requires completion ownership tracking";
+    multipliers[instance] =
+        state.getOrCreateSharedMultiplier(key, rewriter, loc, width, one);
+  }
+
+  auto resultReg = createRegister(loc, rewriter, getComponent(), bitWidth,
+                                  state.getUniqueName("muli"));
+  mul.getResult().replaceAllUsesWith(resultReg.getOut());
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, mul);
+  state.addBlockScheduleable(mul->getBlock(), group);
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+
+  std::optional<calyx::RegisterOp> phaseReg;
+  SmallVector<Value> phaseGuards;
+  Value nextPhase;
+  unsigned phaseWidth = 1;
+  if (selectorValues.size() == 1) {
+    phaseGuards.push_back(trueValue);
+  } else {
+    phaseWidth = llvm::Log2_64_Ceil(selectorValues.size());
+    phaseReg = createRegister(loc, rewriter, getComponent(), phaseWidth,
+                              state.getUniqueName("rotating_phase"));
+    Value zero = createConstant(loc, rewriter, getComponent(), phaseWidth, 0)
+                     .getResult();
+    Value oneValue =
+        createConstant(loc, rewriter, getComponent(), phaseWidth, 1)
+            .getResult();
+
+    auto initGroup = calyx::createGroup<calyx::GroupOp>(
+        rewriter, getComponent(), loc,
+        state.getUniqueName("rotating_phase_init"));
+    calyx::buildAssignmentsForRegisterWrite(rewriter, initGroup, getComponent(),
+                                            *phaseReg, zero);
+    state.addAdditionalPipelineInitGroup(pipeline.getOperation(), initGroup);
+
+    for (unsigned phase = 0; phase < selectorValues.size(); ++phase) {
+      auto eq = state.getNewLibraryOpInstance<calyx::EqLibOp>(
+          rewriter, loc,
+          {rewriter.getIntegerType(phaseWidth),
+           rewriter.getIntegerType(phaseWidth), one});
+      Value phaseValue =
+          createConstant(loc, rewriter, getComponent(), phaseWidth, phase)
+              .getResult();
+      rewriter.setInsertionPointToEnd(group.getBodyBlock());
+      calyx::AssignOp::create(rewriter, loc, eq.getLeft(), phaseReg->getOut());
+      calyx::AssignOp::create(rewriter, loc, eq.getRight(), phaseValue);
+      phaseGuards.push_back(eq.getOut());
+    }
+
+    auto add = state.getNewLibraryOpInstance<calyx::AddLibOp>(
+        rewriter, loc,
+        {rewriter.getIntegerType(phaseWidth),
+         rewriter.getIntegerType(phaseWidth),
+         rewriter.getIntegerType(phaseWidth)});
+    auto mux = state.getNewLibraryOpInstance<calyx::MuxLibOp>(
+        rewriter, loc,
+        {one, rewriter.getIntegerType(phaseWidth),
+         rewriter.getIntegerType(phaseWidth),
+         rewriter.getIntegerType(phaseWidth)});
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    calyx::AssignOp::create(rewriter, loc, add.getLeft(), phaseReg->getOut());
+    calyx::AssignOp::create(rewriter, loc, add.getRight(), oneValue);
+    calyx::AssignOp::create(rewriter, loc, mux.getCond(), phaseGuards.back());
+    calyx::AssignOp::create(rewriter, loc, mux.getTru(), zero);
+    calyx::AssignOp::create(rewriter, loc, mux.getFal(), add.getOut());
+    nextPhase = mux.getOut();
+  }
+
+  // Dispatch each logical invocation to the instance selected for its phase.
+  // The phase register changes only when that invocation completes, so these
+  // guards remain stable for the entire dynamic Calyx group execution.
+  for (auto [phase, instance] : llvm::enumerate(selectorValues)) {
+    auto multiplier = multipliers[instance];
+    Value guard = phaseGuards[phase];
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    calyx::AssignOp::create(rewriter, loc, multiplier.getLeft(), mul.getLhs(),
+                            guard);
+    calyx::AssignOp::create(rewriter, loc, multiplier.getRight(), mul.getRhs(),
+                            guard);
+    Value goGuard = comb::AndOp::create(
+        rewriter, loc, guard,
+        comb::createOrFoldNot(rewriter, loc, multiplier.getDone()), false);
+    calyx::AssignOp::create(rewriter, loc, multiplier.getGo(), trueValue,
+                            goGuard);
+  }
+
+  Value done = multipliers[selectedInstances.front()].getDone();
+  for (auto [index, instance] : llvm::enumerate(selectedInstances)) {
+    auto multiplier = multipliers[instance];
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    calyx::AssignOp::create(rewriter, loc, resultReg.getIn(),
+                            multiplier.getOut(), multiplier.getDone());
+    calyx::AssignOp::create(rewriter, loc, resultReg.getWriteEn(), trueValue,
+                            multiplier.getDone());
+    if (index == 0)
+      continue;
+    auto orOp = state.getNewLibraryOpInstance<calyx::OrLibOp>(rewriter, loc,
+                                                              {one, one, one});
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    calyx::AssignOp::create(rewriter, loc, orOp.getLeft(), done);
+    calyx::AssignOp::create(rewriter, loc, orOp.getRight(),
+                            multiplier.getDone());
+    done = orOp.getOut();
+  }
+
+  if (phaseReg) {
+    calyx::AssignOp::create(rewriter, loc, phaseReg->getIn(), nextPhase);
+    calyx::AssignOp::create(rewriter, loc, phaseReg->getWriteEn(), done);
+  }
+  calyx::GroupDoneOp::create(rewriter, loc, resultReg.getDone());
+
+  state.registerEvaluatingGroup(resultReg.getOut(), group);
+  for (unsigned instance : selectedInstances) {
+    auto multiplier = multipliers[instance];
+    state.registerEvaluatingGroup(multiplier.getLeft(), group);
+    state.registerEvaluatingGroup(multiplier.getRight(), group);
+  }
+  return success();
+}
+
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      MulIOp mul) const {
+  if (auto reservations =
+          mul->getAttrOfType<ArrayAttr>("circt.rotating_resource_reservations"))
+    return buildRotatingMultiplier(rewriter, mul, reservations);
   Location loc = mul.getLoc();
   Type width = mul.getResult().getType(), one = rewriter.getI1Type();
-  auto mulPipe =
-      getState<ComponentLoweringState>()
-          .getNewLibraryOpInstance<calyx::MultPipeLibOp>(
-              rewriter, loc, {one, one, one, width, width, width, one});
+  auto &state = getState<ComponentLoweringState>();
+  calyx::MultPipeLibOp mulPipe;
+  if (auto bindings =
+          mul->getAttrOfType<ArrayAttr>("circt.resource_bindings")) {
+    for (auto attr : bindings) {
+      auto binding = cast<DictionaryAttr>(attr);
+      auto resource = cast<StringAttr>(binding.get("resource"));
+      auto instance = cast<IntegerAttr>(binding.get("instance"));
+      if (auto hold = dyn_cast_or_null<IntegerAttr>(binding.get("hold"));
+          hold && hold.getInt() > 1)
+        return mul.emitError()
+               << "cannot lower a non-fully-pipelined multiplier binding to "
+                  "Calyx without cycle-accurate pipeline control";
+      std::string key = resource.getValue().str() + "." +
+                        std::to_string(instance.getInt()) + "." +
+                        std::to_string(width.getIntOrFloatBitWidth());
+      if (!state.claimResourceInstance(key, mul))
+        return mul.emitError()
+               << "multiple operations bound to static multiplier instance '"
+               << resource.getValue() << "." << instance.getInt()
+               << "' require cycle-accurate stage control";
+      mulPipe =
+          state.getOrCreateSharedMultiplier(key, rewriter, loc, width, one);
+      break;
+    }
+  }
+  if (!mulPipe)
+    mulPipe = state.getNewLibraryOpInstance<calyx::MultPipeLibOp>(
+        rewriter, loc, {one, one, one, width, width, width, one});
   return buildLibraryBinaryPipeOp<calyx::MultPipeLibOp>(
       rewriter, mul, mulPipe,
       /*out=*/mulPipe.getOut());
@@ -1236,8 +1499,12 @@ private:
                  pipeSchedPtr) {
         auto &whileOp = pipeSchedPtr->whileOp;
 
-        auto whileCtrlOp =
-            buildWhileCtrlOp(whileOp, pipeSchedPtr->initGroups, rewriter);
+        SmallVector<calyx::GroupOp> initGroups = pipeSchedPtr->initGroups;
+        llvm::append_range(
+            initGroups,
+            getState<ComponentLoweringState>().getAdditionalPipelineInitGroups(
+                whileOp.getOperation()));
+        auto whileCtrlOp = buildWhileCtrlOp(whileOp, initGroups, rewriter);
         rewriter.setInsertionPointToEnd(whileCtrlOp.getBodyBlock());
         auto whileBodyOp =
             calyx::ParOp::create(rewriter, whileOp.getOperation()->getLoc());

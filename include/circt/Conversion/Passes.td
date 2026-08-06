@@ -27,6 +27,28 @@ def AffineToLoopSchedule : Pass<"convert-affine-to-loopschedule", "mlir::func::F
     the loops to a LoopSchedule.
   }];
   let constructor = "circt::createAffineToLoopSchedule()";
+  let options = [
+    Option<"scheduler", "scheduler", "std::string", "\"simplex\"",
+           "Modulo scheduler to use: simplex or cpsat when OR-Tools is enabled">,
+    Option<"multiplierLimit", "multiplier-limit", "unsigned", "0",
+           "Number of shared multiplier instances (zero means unbounded)">,
+    Option<"multiplierII", "multiplier-ii", "unsigned", "1",
+           "Multiplier resource initiation interval">,
+    Option<"cpsatTimeLimit", "cpsat-time-limit", "double", "0.0",
+           "Total CP-SAT wall-time limit in seconds (zero leaves it unbounded)">,
+    Option<"cpsatWorkers", "cpsat-workers", "unsigned", "0",
+           "CP-SAT search workers (zero uses the OR-Tools default)">,
+    Option<"cpsatMinimizeLatency", "cpsat-minimize-latency", "bool", "true",
+           "Minimize sink latency after finding the minimum feasible II">,
+    Option<"cpsatBalancedProbe", "cpsat-balanced-probe", "bool", "false",
+           "Try the restricted balanced modulo probe before the complete model">,
+    Option<"cpsatBalancedProbeTimeLimit", "cpsat-balanced-probe-time-limit", "double", "1.0",
+           "Per-candidate wall-time limit for the balanced modulo probe">,
+    Option<"cpsatResourceModel", "cpsat-resource-model", "std::string", "\"auto\"",
+           "CP-SAT modulo resource encoding: auto, onehot, or cumulative">,
+    Option<"cpsatReportStatistics", "cpsat-report-statistics", "bool", "false",
+           "Report CP-SAT status, lower bound, II, and resource encoding">
+  ];
   let dependentDialects = [
     "circt::loopschedule::LoopScheduleDialect",
     "mlir::arith::ArithDialect",
