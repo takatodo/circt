@@ -15,6 +15,23 @@ ssp.instance of "ModuloProblem" {
 
 // -----
 
+// expected-error@+1 {{simplex modulo scheduling does not support resource initiation intervals greater than one}}
+ssp.instance @resource_ii of "ModuloProblem" {
+  library {
+    operator_type @op [latency<1>]
+    operator_type @sink [latency<1>]
+  }
+  resource {
+    resource_type @resource [limit<1>, ii<2>]
+  }
+  graph {
+    %0 = operation<@op>() uses[@resource]
+    operation<@sink> @last(%0)
+  }
+}
+
+// -----
+
 // expected-error@+1 {{multiple sinks detected}}
 ssp.instance of "ModuloProblem" {
   library {

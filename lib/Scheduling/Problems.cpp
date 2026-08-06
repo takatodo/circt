@@ -338,7 +338,22 @@ SharedOperatorsProblem::getProperties(ResourceType rsrc) {
   auto psv = Problem::getProperties(rsrc);
   if (auto limit = getLimit(rsrc))
     psv.emplace_back("limit", std::to_string(*limit));
+  if (auto ii = getResourceInitiationInterval(rsrc))
+    psv.emplace_back("II", std::to_string(*ii));
   return psv;
+}
+
+LogicalResult SharedOperatorsProblem::check() {
+  if (failed(Problem::check()))
+    return failure();
+
+  for (auto rsrc : getResourceTypes())
+    if (getResourceInitiationInterval(rsrc).value_or(1) == 0)
+      return getContainingOp()->emitError()
+             << "Resource type '" << rsrc.getValue()
+             << "' has an invalid zero initiation interval";
+
+  return success();
 }
 
 LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
@@ -366,9 +381,10 @@ LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
 
 LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
   auto limit = getLimit(rsrc);
-  if (!limit)
+  if (!limit || *limit == 0)
     return success();
 
+  unsigned resourceII = getResourceInitiationInterval(rsrc).value_or(1);
   llvm::SmallDenseMap<unsigned, unsigned> nOpsPerTimeStep;
   for (auto *op : getOperations()) {
     auto maybeRsrcs = getLinkedResourceTypes(op);
@@ -380,7 +396,8 @@ LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
         }))
       continue;
 
-    ++nOpsPerTimeStep[*getStartTime(op)];
+    for (unsigned offset = 0; offset < resourceII; ++offset)
+      ++nOpsPerTimeStep[*getStartTime(op) + offset];
   }
 
   for (auto &kv : nOpsPerTimeStep)
@@ -388,7 +405,7 @@ LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
       return getContainingOp()->emitError()
              << "Resource type '" << rsrc.getValue() << "' is oversubscribed."
              << "\n  time step: " << kv.first
-             << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
+             << "\n  #reservations: " << kv.second << "\n  limit: " << *limit;
 
   return success();
 }
@@ -410,10 +427,11 @@ LogicalResult SharedOperatorsProblem::verify() {
 
 LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
   auto limit = getLimit(rsrc);
-  if (!limit)
+  if (!limit || *limit == 0)
     return success();
 
   unsigned ii = *getInitiationInterval();
+  unsigned resourceII = getResourceInitiationInterval(rsrc).value_or(1);
   llvm::SmallDenseMap<unsigned, unsigned> nOpsPerCongruenceClass;
   for (auto *op : getOperations()) {
     auto maybeRsrcs = getLinkedResourceTypes(op);
@@ -425,7 +443,8 @@ LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
         }))
       continue;
 
-    ++nOpsPerCongruenceClass[*getStartTime(op) % ii];
+    for (unsigned offset = 0; offset < resourceII; ++offset)
+      ++nOpsPerCongruenceClass[(*getStartTime(op) + offset) % ii];
   }
 
   for (auto &kv : nOpsPerCongruenceClass)
@@ -433,7 +452,7 @@ LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
       return getContainingOp()->emitError()
              << "Resource type '" << rsrc.getValue() << "' is oversubscribed."
              << "\n  congruence class: " << kv.first
-             << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
+             << "\n  #reservations: " << kv.second << "\n  limit: " << *limit;
 
   return success();
 }

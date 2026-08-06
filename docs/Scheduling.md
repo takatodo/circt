@@ -266,8 +266,9 @@ as well as redundant iteration over the problem components.
   assumed to be fully pipelined.
 - [SharedOperatorsProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1SharedOperatorsProblem.html):
   A resource-constrained scheduling problem that corresponds to multiplexing
-  multiple operations onto a pre-allocated number of fully pipelined operator
-  instances.
+  multiple operations onto a pre-allocated number of operator instances. A
+  resource initiation interval controls how often each instance can accept a
+  new request and defaults to one for fully pipelined operators.
 - [ModuloProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ModuloProblem.html):
   Models an HLS classic: Pipeline scheduling with limited resources.
 - [ChainingProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ChainingProblem.html):

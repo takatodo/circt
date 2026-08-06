@@ -635,7 +635,8 @@ struct Default<scheduling::SharedOperatorsProblem> {
       Default<scheduling::Problem>::operationProperties;
   static constexpr auto operatorTypeProperties =
       Default<scheduling::Problem>::operatorTypeProperties;
-  static constexpr auto resourceTypeProperties = std::make_tuple(LimitAttr());
+  static constexpr auto resourceTypeProperties =
+      std::make_tuple(LimitAttr(), ResourceInitiationIntervalAttr());
   static constexpr auto dependenceProperties =
       Default<scheduling::Problem>::dependenceProperties;
   static constexpr auto instanceProperties =

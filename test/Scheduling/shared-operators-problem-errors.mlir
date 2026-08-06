@@ -29,3 +29,34 @@ ssp.instance @oversubscribed of "SharedOperatorsProblem" {
     operation<@limited>() uses[@limited_rsrc] [t<0>]
   }
 }
+
+// -----
+
+// expected-error@+1 {{Resource type 'limited_rsrc' is oversubscribed}}
+ssp.instance @overlapping_reservations of "SharedOperatorsProblem" {
+  library {
+    operator_type @limited [latency<1>]
+  }
+  resource {
+    resource_type @limited_rsrc [limit<1>, ii<3>]
+  }
+  graph {
+    operation<@limited>() uses[@limited_rsrc] [t<0>]
+    operation<@limited>() uses[@limited_rsrc] [t<1>]
+  }
+}
+
+// -----
+
+// expected-error@+1 {{Resource type 'limited_rsrc' has an invalid zero initiation interval}}
+ssp.instance @zero_resource_ii of "SharedOperatorsProblem" {
+  library {
+    operator_type @limited [latency<1>]
+  }
+  resource {
+    resource_type @limited_rsrc [limit<1>, ii<0>]
+  }
+  graph {
+    operation<@limited>() uses[@limited_rsrc] [t<0>]
+  }
+}

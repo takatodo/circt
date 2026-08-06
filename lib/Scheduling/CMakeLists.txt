@@ -33,3 +33,9 @@ add_circt_library(CIRCTScheduling
   LINK_LIBS PUBLIC
   ${SCHEDULING_LIBS}
   )
+
+# add_circt_library builds sources through an object library. Link OR-Tools to
+# that target as well so its public compile definitions reach its sources.
+if(ortools_FOUND)
+  target_link_libraries(obj.CIRCTScheduling PRIVATE ortools::ortools)
+endif()

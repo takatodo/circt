@@ -69,3 +69,22 @@ ssp.instance @multiple of "SharedOperatorsProblem" {
     operation<@_1> @last(%5) [t<11>]
   }
 }
+
+// CHECK-LABEL: resource_initiation_interval
+ssp.instance @resource_initiation_interval of "SharedOperatorsProblem" {
+  library {
+    operator_type @short [latency<1>]
+    operator_type @sink [latency<1>]
+  }
+  resource {
+    // CHECK: resource_type @non_pipelined [limit<1>, ii<3>]
+    resource_type @non_pipelined [limit<1>, ii<3>]
+  }
+  graph {
+    %0 = operation<@short>() uses[@non_pipelined] [t<0>]
+    %1 = operation<@short>() uses[@non_pipelined] [t<3>]
+    // SIMPLEX: @last(%{{.*}}, %{{.*}}) [t<4>]
+    // CPSAT: @last(%{{.*}}, %{{.*}}) [t<4>]
+    operation<@sink> @last(%0, %1) [t<4>]
+  }
+}

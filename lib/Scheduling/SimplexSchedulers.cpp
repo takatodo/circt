@@ -944,12 +944,19 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     auto rsrc = rsrcs[0];
     unsigned limit = prob.getLimit(rsrc).value_or(0);
     assert(limit > 0);
+    unsigned resourceII = prob.getResourceInitiationInterval(rsrc).value_or(1);
 
     // Find the first time step (beginning at the current start time in the
-    // partial schedule) in which an operator instance is available.
+    // partial schedule) whose complete reservation interval has capacity.
     unsigned startTimeVar = startTimeVariables[op];
     unsigned candTime = getStartTime(startTimeVar);
-    while (reservationTable[rsrc].lookup(candTime) == limit)
+    auto isAvailable = [&](unsigned time) {
+      for (unsigned offset = 0; offset < resourceII; ++offset)
+        if (reservationTable[rsrc].lookup(time + offset) >= limit)
+          return false;
+      return true;
+    };
+    while (!isAvailable(candTime))
       ++candTime;
 
     // Fix the start time. As explained above, this cannot make the problem
@@ -958,8 +965,9 @@ LogicalResult SharedOperatorsSimplexScheduler::schedule() {
     assert(succeeded(fixed));
     (void)fixed;
 
-    // Record the operator use.
-    ++reservationTable[rsrc][candTime];
+    // Record the complete resource reservation.
+    for (unsigned offset = 0; offset < resourceII; ++offset)
+      ++reservationTable[rsrc][candTime + offset];
 
     LLVM_DEBUG(dbgs() << "After scheduling " << startTimeVar
                       << " to t=" << candTime << ":\n";
@@ -1383,6 +1391,12 @@ LogicalResult scheduling::scheduleSimplex(SharedOperatorsProblem &prob,
 
 LogicalResult scheduling::scheduleSimplex(ModuloProblem &prob,
                                           Operation *lastOp) {
+  for (auto resource : prob.getResourceTypes())
+    if (prob.getResourceInitiationInterval(resource).value_or(1) > 1)
+      return prob.getContainingOp()->emitError()
+             << "simplex modulo scheduling does not support resource "
+                "initiation intervals greater than one";
+
   ModuloSimplexScheduler simplex(prob, lastOp);
   return simplex.schedule();
 }

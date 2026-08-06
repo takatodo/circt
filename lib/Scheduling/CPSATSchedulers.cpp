@@ -20,6 +20,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 
+#include <algorithm>
+
 #define DEBUG_TYPE "cpsat-schedulers"
 
 using namespace circt;
@@ -29,6 +31,18 @@ using namespace operations_research::sat;
 
 using llvm::dbgs;
 using llvm::format;
+
+/// Return a conservative duration for serializing \p task with every other
+/// task. A resource may remain busy after the operation result is available.
+static unsigned getSerialSpan(SharedOperatorsProblem &prob, Operation *task) {
+  unsigned span = *prob.getLatency(*prob.getLinkedOperatorType(task));
+  if (auto resources = prob.getLinkedResourceTypes(task))
+    for (auto resource : *resources)
+      if (prob.getLimit(resource).value_or(0) > 0)
+        span = std::max(
+            span, prob.getResourceInitiationInterval(resource).value_or(1));
+  return span;
+}
 
 /// Solve the shared operators problem by modeling it as a Resource
 /// Constrained Project Scheduling Problem (RCPSP), which in turn is formulated
@@ -52,20 +66,16 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
   DenseMap<Problem::ResourceType, SmallVector<IntervalVar, 4>>
       resourcesToTaskIntervals;
 
-  // First get horizon, i.e., the time taken if all operations were executed
-  // sequentially.
+  // First get a horizon from a schedule that executes every operation and
+  // waits for each held resource before issuing the next one.
   unsigned horizon = 0;
-  for (auto *task : tasks) {
-    unsigned duration = *prob.getLatency(*prob.getLinkedOperatorType(task));
-    horizon += duration;
-  }
+  for (auto *task : tasks)
+    horizon += getSerialSpan(prob, task);
 
-  // Build task-interval decision variables, which effectively serve to
-  // constrain startVar and endVar to be duration apart. Then map them
-  // to the resources (operators) consumed during those intervals. Note,
-  // resources are in fact not constrained to be occupied for the whole of the
-  // task interval, but only during the first "tick". See comment below
-  // regarding cpModel.NewFixedSizeIntervalVar.
+  // Build task-interval decision variables, which constrain startVar and endVar
+  // to be the operation latency apart. Map them to the resources they use; the
+  // cumulative constraints below derive separate reservation intervals from
+  // their start expressions.
   for (auto item : llvm::enumerate(tasks)) {
     auto i = item.index();
     auto *task = item.value();
@@ -84,7 +94,7 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
     auto resourceListOpt = prob.getLinkedResourceTypes(task);
     if (resourceListOpt) {
       for (const auto &resource : *resourceListOpt) {
-        if (auto limitOpt = prob.getLimit(resource))
+        if (auto limitOpt = prob.getLimit(resource); limitOpt && *limitOpt > 0)
           resourcesToTaskIntervals[resource].push_back(taskInterval);
       }
     }
@@ -123,10 +133,10 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
           (Twine("demand_") + Twine(i) + Twine("_") +
            Twine(resource.getAttr().strref()))
               .str());
-      // Conventional formulation for SharedOperatorsProblem;
-      // interval during which the resource is occupied has size 1.
-      IntervalVar start =
-          cpModel.NewFixedSizeIntervalVar(taskInterval.StartExpr(), 1);
+      // Reserve one resource instance until it can accept its next request.
+      IntervalVar start = cpModel.NewFixedSizeIntervalVar(
+          taskInterval.StartExpr(),
+          prob.getResourceInitiationInterval(resource).value_or(1));
       cumu.AddDemand(start, demandVar);
     }
   }
