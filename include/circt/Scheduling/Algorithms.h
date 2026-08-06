@@ -15,7 +15,11 @@
 
 #include "circt/Scheduling/Problems.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
+
 #include <cstdint>
+#include <optional>
 
 namespace circt {
 namespace scheduling {
@@ -174,6 +178,104 @@ LogicalResult
 improveModuloScheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
                            const CPSATModuloLocalSearchOptions &options = {},
                            CPSATModuloLocalSearchResult *result = nullptr);
+
+/// A requested number of instances for one resource type.
+struct ResourceLimit {
+  Problem::ResourceType resource;
+  unsigned limit;
+};
+
+/// A complete allocation of all resource types in a problem.
+struct ResourceAllocation {
+  SmallVector<ResourceLimit, 4> limits;
+};
+
+/// One periodic resource reservation made by an operation in a modulo
+/// schedule. The operation issues in `phase` modulo `period` and occupies one
+/// of `instances` physical resources for `hold` cycles. Unlike a static
+/// binding, the selected physical instance may rotate between iterations.
+struct RotatingResourceReservation {
+  Problem::ResourceType resource;
+  unsigned phase;
+  unsigned period;
+  unsigned hold;
+  unsigned instances;
+};
+
+/// The schedule assigned to one operation in problem insertion order.
+struct OperationScheduleCertificate {
+  unsigned startTime;
+
+  /// Static instance assignments ordered like the operation's limited
+  /// resource types. This is absent when the operation uses rotating
+  /// reservations instead.
+  std::optional<SmallVector<unsigned, 2>> resourceBindings;
+
+  /// Periodic reservations used when no static resource binding exists.
+  SmallVector<RotatingResourceReservation, 2> rotatingReservations;
+};
+
+/// A self-contained schedule which can be reapplied without invoking a
+/// scheduler. Entries correspond one-to-one with `Problem::getOperations()`.
+struct ResourceScheduleCertificate {
+  SmallVector<OperationScheduleCertificate, 0> operations;
+};
+
+/// A non-dominated resource allocation discovered by an outer exploration.
+struct ResourceParetoPoint {
+  ResourceAllocation allocation;
+  unsigned latency;
+  uint64_t resourceCost;
+  /// Pipeline II for a modulo schedule, or zero for an acyclic schedule.
+  unsigned initiationInterval = 0;
+  ResourceScheduleCertificate schedule;
+};
+
+/// Apply and verify a previously captured Pareto point without rerunning its
+/// scheduler. The certificate must describe the operations in problem
+/// insertion order and its recorded latency must match `lastOp`'s start time.
+LogicalResult applyResourceParetoPoint(SharedOperatorsProblem &prob,
+                                       Operation *lastOp,
+                                       const ResourceParetoPoint &point);
+
+/// Modulo-scheduling variant. In addition to static resource bindings, this
+/// accepts explicit rotating reservations and restores the recorded II.
+LogicalResult applyResourceParetoPoint(ModuloProblem &prob, Operation *lastOp,
+                                       const ResourceParetoPoint &point);
+
+/// Computes the implementation cost of a complete resource allocation.
+using ResourceCostFunction = function_ref<uint64_t(const ResourceAllocation &)>;
+
+/// Schedule each complete resource allocation with CP-SAT and return the
+/// latency/resource-cost Pareto frontier. Missing acyclic bindings are
+/// synthesized deterministically from the verified interval schedule. The
+/// problem is left at the least-cost frontier point without rerunning CP-SAT.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   const CPSATSchedulerOptions &options = {});
+
+/// As above, but use a client-provided resource cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   ResourceCostFunction costFunction,
+                   const CPSATSchedulerOptions &options = {});
+
+/// Modulo-scheduling CP-SAT Pareto exploration. Unbound resource uses receive
+/// a static circular coloring when one is found cheaply, and otherwise are
+/// captured as explicit rotating reservations at the solver's selected II.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   const CPSATSchedulerOptions &options = {});
+
+/// As above, but use a client-provided resource cost model.
+FailureOr<SmallVector<ResourceParetoPoint>>
+exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                   ArrayRef<ResourceAllocation> allocations,
+                   ResourceCostFunction costFunction,
+                   const CPSATSchedulerOptions &options = {});
 
 } // namespace scheduling
 } // namespace circt

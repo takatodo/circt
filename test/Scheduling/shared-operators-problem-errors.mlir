@@ -60,3 +60,19 @@ ssp.instance @zero_resource_ii of "SharedOperatorsProblem" {
     operation<@limited>() uses[@limited_rsrc] [t<0>]
   }
 }
+
+// -----
+
+// expected-error@+1 {{Resource instance 0 of type 'limited_rsrc' has overlapping bindings}}
+ssp.instance @overlapping_bindings of "SharedOperatorsProblem" {
+  library {
+    operator_type @limited [latency<1>]
+  }
+  resource {
+    resource_type @limited_rsrc [limit<2>, ii<3>]
+  }
+  graph {
+    operation<@limited>() uses[@limited_rsrc] [t<0>, bindings<[0]>]
+    operation<@limited>() uses[@limited_rsrc] [t<1>, bindings<[0]>]
+  }
+}

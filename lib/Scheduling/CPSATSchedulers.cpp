@@ -13,6 +13,8 @@
 
 #include "circt/Scheduling/Algorithms.h"
 
+#include "ResourceSchedule.h"
+
 #include "mlir/IR/Operation.h"
 
 #include "ortools/sat/cp_model.h"
@@ -555,6 +557,7 @@ LogicalResult scheduling::scheduleCPSAT(SharedOperatorsProblem &prob,
   Operation *containingOp = prob.getContainingOp();
   if (!prob.hasOperation(lastOp))
     return containingOp->emitError("problem does not include last operation");
+  prob.clearResourceBindings();
 
   CpModelBuilder cpModel;
   auto &tasks = prob.getOperations();
@@ -759,6 +762,7 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
         if (result)
           result->balancedProbeAttempted |= probe.attempted;
         if (!probe.startTimes.empty()) {
+          prob.clearResourceBindings();
           for (auto [task, start] : llvm::zip(tasks, probe.startTimes))
             prob.setStartTime(task, start);
           prob.setInitiationInterval(ii);
@@ -939,6 +943,7 @@ LogicalResult scheduling::scheduleCPSAT(ModuloProblem &prob, Operation *lastOp,
       return containingOp->emitError("CP-SAT time limit exceeded");
     }
 
+    prob.clearResourceBindings();
     for (Operation *task : tasks)
       prob.setStartTime(task, SolutionIntegerValue(response, starts[task]));
     prob.setInitiationInterval(ii);
@@ -1129,6 +1134,7 @@ LogicalResult scheduling::improveModuloScheduleCPSAT(
 
   for (Operation *task : neighborhood)
     prob.setStartTime(task, SolutionIntegerValue(response, starts[task]));
+  prob.clearResourceBindings();
   if (failed(prob.verify())) {
     for (Operation *task : neighborhood)
       prob.setStartTime(task, incumbentStarts.lookup(task));
@@ -1138,4 +1144,52 @@ LogicalResult scheduling::improveModuloScheduleCPSAT(
   if (result)
     result->finalObjective = candidateObjective;
   return success();
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               ResourceCostFunction costFunction,
+                               const CPSATSchedulerOptions &options) {
+  auto schedule = [&] { return scheduleCPSAT(prob, lastOp, options); };
+  return detail::exploreResourcePareto(prob, lastOp, allocations, costFunction,
+                                       schedule, "CP-SAT");
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(SharedOperatorsProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               const CPSATSchedulerOptions &options) {
+  auto defaultCost = [&](const ResourceAllocation &allocation) {
+    uint64_t resourceCost = 0;
+    for (const auto &entry : allocation.limits)
+      resourceCost += static_cast<uint64_t>(entry.limit) *
+                      prob.getResourceCost(entry.resource).value_or(1);
+    return resourceCost;
+  };
+  return exploreCPSATPareto(prob, lastOp, allocations, defaultCost, options);
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               ResourceCostFunction costFunction,
+                               const CPSATSchedulerOptions &options) {
+  auto schedule = [&] { return scheduleCPSAT(prob, lastOp, options); };
+  return detail::exploreResourcePareto(prob, lastOp, allocations, costFunction,
+                                       schedule, "CP-SAT");
+}
+
+FailureOr<SmallVector<ResourceParetoPoint>>
+scheduling::exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
+                               ArrayRef<ResourceAllocation> allocations,
+                               const CPSATSchedulerOptions &options) {
+  auto defaultCost = [&](const ResourceAllocation &allocation) {
+    uint64_t resourceCost = 0;
+    for (const auto &entry : allocation.limits)
+      resourceCost += static_cast<uint64_t>(entry.limit) *
+                      prob.getResourceCost(entry.resource).value_or(1);
+    return resourceCost;
+  };
+  return exploreCPSATPareto(prob, lastOp, allocations, defaultCost, options);
 }

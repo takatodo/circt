@@ -11,5 +11,6 @@ endfunction()
 
 add_subdirectory(Conversion)
 add_subdirectory(Dialect)
+add_subdirectory(Scheduling)
 add_subdirectory(Support)
 add_subdirectory(Tools)

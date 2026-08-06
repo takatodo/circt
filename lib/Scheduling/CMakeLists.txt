@@ -4,6 +4,7 @@ set(LLVM_OPTIONAL_SOURCES
   CPSATSchedulers.cpp
   LPSchedulers.cpp
   Problems.cpp
+  ResourceSchedule.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
   )
@@ -12,6 +13,7 @@ set(SCHEDULING_SOURCES
   ASAPScheduler.cpp
   ChainingSupport.cpp
   Problems.cpp
+  ResourceSchedule.cpp
   SimplexSchedulers.cpp
   Utilities.cpp
   )

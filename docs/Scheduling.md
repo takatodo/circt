@@ -314,6 +314,15 @@ chaining-enabled modulo scheduling problem.
   exact alternatives; `auto` selects the cumulative encoding for large phase
   expansions.
 
+### Replayable resource schedules
+
+Resource-allocation exploration returns `ResourceParetoPoint` values carrying
+the allocation, latency, pipeline II, operation start times, and either static
+instance bindings or periodic rotating reservations. A point can be reapplied
+and verified without invoking the scheduler again. CP-SAT Pareto exploration
+also colors its start-time-only result into static bindings when possible and
+retains an explicit rotating reservation when no static modulo coloring exists.
+
 ## Utilities
 
 See

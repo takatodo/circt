@@ -636,11 +636,12 @@ struct Default<scheduling::ChainingProblem> {
 template <>
 struct Default<scheduling::SharedOperatorsProblem> {
   static constexpr auto operationProperties =
-      Default<scheduling::Problem>::operationProperties;
+      std::tuple_cat(Default<scheduling::Problem>::operationProperties,
+                     std::make_tuple(ResourceBindingsAttr()));
   static constexpr auto operatorTypeProperties =
       Default<scheduling::Problem>::operatorTypeProperties;
-  static constexpr auto resourceTypeProperties =
-      std::make_tuple(LimitAttr(), ResourceInitiationIntervalAttr());
+  static constexpr auto resourceTypeProperties = std::make_tuple(
+      LimitAttr(), ResourceInitiationIntervalAttr(), ResourceCostAttr());
   static constexpr auto dependenceProperties =
       Default<scheduling::Problem>::dependenceProperties;
   static constexpr auto instanceProperties =

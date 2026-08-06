@@ -495,6 +495,8 @@ protected:
 private:
   ResourceTypeProperty<unsigned> limit;
   ResourceTypeProperty<unsigned> initiationInterval;
+  ResourceTypeProperty<unsigned> cost;
+  OperationProperty<SmallVector<unsigned>> resourceBindings;
 
 public:
   /// The limit is the maximum number of operations using \p rsrc that are
@@ -514,6 +516,25 @@ public:
     initiationInterval[rsrc] = val;
   }
 
+  /// The non-negative implementation cost of one instance of this resource.
+  /// Clients that do not set a cost can use one as the uniform default when
+  /// comparing resource allocations.
+  std::optional<unsigned> getResourceCost(ResourceType rsrc) {
+    return cost.lookup(rsrc);
+  }
+  void setResourceCost(ResourceType rsrc, unsigned val) { cost[rsrc] = val; }
+
+  /// The physical instance selected for each limited resource used by an
+  /// operation. Bindings are ordered like the operation's limited resource
+  /// types.
+  std::optional<SmallVector<unsigned>> getResourceBindings(Operation *op) {
+    return resourceBindings.lookup(op);
+  }
+  void setResourceBindings(Operation *op, SmallVector<unsigned> bindings) {
+    resourceBindings[op] = std::move(bindings);
+  }
+  void clearResourceBindings() { resourceBindings.clear(); }
+
   virtual PropertyStringVector getProperties(ResourceType rsrc) override;
 
 protected:
@@ -521,6 +542,8 @@ protected:
   virtual LogicalResult checkLatency(Operation *op) override;
   /// \p rsrc is not oversubscribed in any time step.
   virtual LogicalResult verifyUtilization(ResourceType rsrc);
+  /// \p rsrc's explicitly assigned instances do not overlap.
+  virtual LogicalResult verifyBindings(ResourceType rsrc);
 
 public:
   virtual LogicalResult check() override;
@@ -549,6 +572,8 @@ protected:
 
   /// \p opr is not oversubscribed in any congruence class modulo II.
   virtual LogicalResult verifyUtilization(ResourceType rsrc) override;
+  /// \p rsrc's explicitly assigned instances do not overlap modulo II.
+  virtual LogicalResult verifyBindings(ResourceType rsrc) override;
 
 public:
   LogicalResult check() override;

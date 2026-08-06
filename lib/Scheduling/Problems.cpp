@@ -15,6 +15,9 @@
 
 #include "mlir/IR/Operation.h"
 
+#include <algorithm>
+#include <tuple>
+
 using namespace circt;
 using namespace circt::scheduling;
 using namespace circt::scheduling::detail;
@@ -340,6 +343,8 @@ SharedOperatorsProblem::getProperties(ResourceType rsrc) {
     psv.emplace_back("limit", std::to_string(*limit));
   if (auto ii = getResourceInitiationInterval(rsrc))
     psv.emplace_back("ii", std::to_string(*ii));
+  if (auto cost = getResourceCost(rsrc))
+    psv.emplace_back("cost", std::to_string(*cost));
   return psv;
 }
 
@@ -411,12 +416,82 @@ LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
   return success();
 }
 
+LogicalResult SharedOperatorsProblem::verifyBindings(ResourceType rsrc) {
+  auto limit = getLimit(rsrc);
+  if (!limit || *limit == 0)
+    return success();
+
+  struct BoundOperation {
+    unsigned startTime;
+    unsigned binding;
+  };
+  SmallVector<BoundOperation> boundOperations;
+  bool hasAnyBindings = false;
+  bool hasMissingBindings = false;
+  for (auto *op : getOperations()) {
+    auto resources = getLinkedResourceTypes(op);
+    if (!resources)
+      continue;
+    SmallVector<ResourceType> limitedResources;
+    for (auto resource : *resources)
+      if (getLimit(resource).value_or(0) > 0 &&
+          std::find(limitedResources.begin(), limitedResources.end(),
+                    resource) == limitedResources.end())
+        limitedResources.push_back(resource);
+
+    auto bindings = getResourceBindings(op);
+    if (!limitedResources.empty()) {
+      hasAnyBindings |= bindings.has_value();
+      hasMissingBindings |= !bindings.has_value();
+    }
+    if (!bindings)
+      continue;
+    if (bindings->size() != limitedResources.size())
+      return op->emitError(
+          "Operation has an invalid number of resource bindings");
+    for (auto [index, resource] : llvm::enumerate(limitedResources)) {
+      if (resource != rsrc)
+        continue;
+      if ((*bindings)[index] >= *limit)
+        return op->emitError() << "Operation binding for resource '"
+                               << rsrc.getValue() << "' is out of range";
+      boundOperations.push_back({*getStartTime(op), (*bindings)[index]});
+    }
+  }
+  if (!hasAnyBindings)
+    return success();
+  if (hasMissingBindings)
+    return getContainingOp()->emitError(
+        "A resource-bound schedule must bind every limited operation");
+
+  llvm::sort(boundOperations,
+             [](const BoundOperation &lhs, const BoundOperation &rhs) {
+               return std::tie(lhs.binding, lhs.startTime) <
+                      std::tie(rhs.binding, rhs.startTime);
+             });
+  unsigned ii = getResourceInitiationInterval(rsrc).value_or(1);
+  for (unsigned index = 1, e = boundOperations.size(); index != e; ++index) {
+    const auto &previous = boundOperations[index - 1];
+    const auto &current = boundOperations[index];
+    if (previous.binding == current.binding &&
+        previous.startTime + ii > current.startTime)
+      return getContainingOp()->emitError()
+             << "Resource instance " << previous.binding << " of type '"
+             << rsrc.getValue() << "' has overlapping bindings";
+  }
+  return success();
+}
+
 LogicalResult SharedOperatorsProblem::verify() {
   if (failed(Problem::verify()))
     return failure();
 
   for (auto rsrc : getResourceTypes())
     if (failed(verifyUtilization(rsrc)))
+      return failure();
+
+  for (auto rsrc : getResourceTypes())
+    if (failed(verifyBindings(rsrc)))
       return failure();
 
   return success();
@@ -464,6 +539,89 @@ LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
   return success();
 }
 
+LogicalResult ModuloProblem::verifyBindings(ResourceType rsrc) {
+  auto limit = getLimit(rsrc);
+  if (!limit || *limit == 0)
+    return success();
+
+  struct BoundOperation {
+    unsigned binding;
+    unsigned startTime;
+  };
+  SmallVector<BoundOperation> boundOperations;
+  bool hasAnyBindings = false;
+  bool hasMissingBindings = false;
+  for (auto *op : getOperations()) {
+    auto resources = getLinkedResourceTypes(op);
+    if (!resources)
+      continue;
+    SmallVector<ResourceType> limitedResources;
+    for (auto resource : *resources)
+      if (getLimit(resource).value_or(0) > 0 &&
+          !llvm::is_contained(limitedResources, resource))
+        limitedResources.push_back(resource);
+    auto it = llvm::find(limitedResources, rsrc);
+    if (it == limitedResources.end())
+      continue;
+
+    auto bindings = getResourceBindings(op);
+    if (!bindings || bindings->size() != limitedResources.size()) {
+      hasMissingBindings = true;
+      continue;
+    }
+    hasAnyBindings = true;
+    unsigned binding = (*bindings)[it - limitedResources.begin()];
+    if (binding >= *limit)
+      return getContainingOp()->emitError()
+             << "Resource binding " << binding << " is out of range for type '"
+             << rsrc.getValue() << "'";
+    boundOperations.push_back({binding, *getStartTime(op)});
+  }
+  if (!hasAnyBindings)
+    return success();
+  if (hasMissingBindings)
+    return getContainingOp()->emitError(
+        "A resource-bound schedule must bind every limited operation");
+
+  unsigned pipelineII = *getInitiationInterval();
+  unsigned resourceII = getResourceInitiationInterval(rsrc).value_or(1);
+  if (resourceII > pipelineII)
+    return getContainingOp()->emitError()
+           << "Static modulo resource bindings require resource initiation "
+              "interval no larger than the pipeline II";
+
+  llvm::sort(boundOperations, [pipelineII](const BoundOperation &lhs,
+                                           const BoundOperation &rhs) {
+    return std::make_tuple(lhs.binding, lhs.startTime % pipelineII) <
+           std::make_tuple(rhs.binding, rhs.startTime % pipelineII);
+  });
+  for (unsigned begin = 0, e = boundOperations.size(); begin != e;) {
+    unsigned end = begin + 1;
+    while (end != e &&
+           boundOperations[end].binding == boundOperations[begin].binding)
+      ++end;
+    if (end - begin == 1) {
+      begin = end;
+      continue;
+    }
+    for (unsigned index = begin; index != end; ++index) {
+      const auto &current = boundOperations[index];
+      const auto &next = boundOperations[index + 1 == end ? begin : index + 1];
+      unsigned currentPhase = current.startTime % pipelineII;
+      unsigned nextPhase = next.startTime % pipelineII;
+      unsigned distance = nextPhase >= currentPhase
+                              ? nextPhase - currentPhase
+                              : nextPhase + pipelineII - currentPhase;
+      if (distance < resourceII)
+        return getContainingOp()->emitError()
+               << "Resource instance " << current.binding << " of type '"
+               << rsrc.getValue() << " has overlapping modulo bindings";
+    }
+    begin = end;
+  }
+  return success();
+}
+
 LogicalResult ModuloProblem::verify() {
   if (failed(CyclicProblem::verify()))
     return failure();
@@ -472,6 +630,10 @@ LogicalResult ModuloProblem::verify() {
   // verification of the base problem.
   for (auto rsrc : getResourceTypes())
     if (failed(verifyUtilization(rsrc)))
+      return failure();
+
+  for (auto rsrc : getResourceTypes())
+    if (failed(verifyBindings(rsrc)))
       return failure();
 
   return success();
