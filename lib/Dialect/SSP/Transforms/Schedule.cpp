@@ -98,6 +98,52 @@ static FailureOr<NodeRLSchedulerOptions> getNodeRLOptions(InstanceOp instOp,
       }
       continue;
     }
+    if (option.consume_front("mcts-trees=")) {
+      if (option.getAsInteger(10, result.mctsRescueTrees)) {
+        instOp.emitError("invalid node-rl 'mcts-trees' option; expected an "
+                         "unsigned integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-simulations=")) {
+      if (option.getAsInteger(10, result.mctsRescueSimulations) ||
+          result.mctsRescueSimulations == 0) {
+        instOp.emitError("invalid node-rl 'mcts-simulations' option; expected "
+                         "a positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-tree-width=")) {
+      if (option.getAsInteger(10, result.mctsTreeWidth) ||
+          result.mctsTreeWidth == 0) {
+        instOp.emitError("invalid node-rl 'mcts-tree-width' option; expected a "
+                         "positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-rollout-width=")) {
+      if (option.getAsInteger(10, result.mctsRolloutWidth) ||
+          result.mctsRolloutWidth == 0) {
+        instOp.emitError(
+            "invalid node-rl 'mcts-rollout-width' option; expected a positive "
+            "integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("mcts-time-limit=")) {
+      if (option.getAsDouble(result.mctsTimeLimitSeconds) ||
+          !std::isfinite(result.mctsTimeLimitSeconds) ||
+          result.mctsTimeLimitSeconds <= 0.0) {
+        instOp.emitError("invalid node-rl 'mcts-time-limit' option; expected a "
+                         "finite positive number");
+        return failure();
+      }
+      continue;
+    }
     if (option.consume_front("local-search-nodes=")) {
       if (option.getAsInteger(10, result.localSearchNodes)) {
         instOp.emitError("invalid node-rl 'local-search-nodes' option; "

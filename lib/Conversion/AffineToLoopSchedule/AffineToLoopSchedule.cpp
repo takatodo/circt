@@ -538,6 +538,11 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
     options.episodes = nodeRLEpisodes;
     options.episodeNodeBudget = nodeRLEpisodeNodeBudget;
     options.resourceOrderingBudget = nodeRLResourceOrderingBudget;
+    options.mctsRescueTrees = nodeRLMCTSTrees;
+    options.mctsRescueSimulations = nodeRLMCTSSimulations;
+    options.mctsTreeWidth = nodeRLMCTSTreeWidth;
+    options.mctsRolloutWidth = nodeRLMCTSRolloutWidth;
+    options.mctsTimeLimitSeconds = nodeRLMCTSTimeLimit;
     options.localSearchNodes = nodeRLLocalSearchNodes;
     options.localSearchTimeLimitSeconds = nodeRLLocalSearchTimeLimit;
     options.seed = nodeRLSeed;

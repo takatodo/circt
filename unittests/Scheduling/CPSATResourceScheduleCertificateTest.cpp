@@ -13,6 +13,7 @@
 
 #include "gtest/gtest.h"
 
+#include <array>
 
 using namespace mlir;
 using namespace circt;
@@ -35,6 +36,49 @@ struct TestIR {
   OwningOpRef<ModuleOp> module;
   OpBuilder builder;
 };
+
+static ::testing::AssertionResult
+auditStaticFrontier(ModuloProblem &problem, Operation *last,
+                    ArrayRef<ResourceParetoPoint> frontier,
+                    unsigned expectedPoints, unsigned expectedOperations,
+                    unsigned expectedResourceUses) {
+  if (frontier.size() != expectedPoints)
+    return ::testing::AssertionFailure()
+           << "expected " << expectedPoints << " frontier points, got "
+           << frontier.size();
+  for (const auto &point : frontier) {
+    if (point.schedule.operations.size() != expectedOperations)
+      return ::testing::AssertionFailure()
+             << "certificate operation count differs at cost "
+             << point.resourceCost;
+    if (failed(applyResourceParetoPoint(problem, last, point)))
+      return ::testing::AssertionFailure()
+             << "could not apply frontier point at cost " << point.resourceCost;
+    if (failed(problem.verify()))
+      return ::testing::AssertionFailure()
+             << "frontier point failed verification at cost "
+             << point.resourceCost;
+    if (*problem.getInitiationInterval() != point.initiationInterval ||
+        *problem.getStartTime(last) != point.latency)
+      return ::testing::AssertionFailure()
+             << "replay changed metrics at cost " << point.resourceCost;
+
+    unsigned staticBindings = 0;
+    unsigned rotatingReservations = 0;
+    for (const auto &operation : point.schedule.operations) {
+      if (operation.resourceBindings)
+        staticBindings += operation.resourceBindings->size();
+      rotatingReservations += operation.rotatingReservations.size();
+    }
+    if (staticBindings != expectedResourceUses || rotatingReservations != 0)
+      return ::testing::AssertionFailure()
+             << "expected a complete static coloring at cost "
+             << point.resourceCost << ", got " << staticBindings
+             << " bindings and " << rotatingReservations
+             << " rotating reservations";
+  }
+  return ::testing::AssertionSuccess();
+}
 
 TEST(CPSATResourceScheduleCertificateTest, ReappliesEveryAcyclicParetoPoint) {
   TestIR ir;
@@ -160,5 +204,114 @@ TEST(CPSATResourceScheduleCertificateTest, ReappliesEveryModuloParetoPoint) {
   EXPECT_EQ(reservation.instances, 2u);
 }
 
+TEST(CPSATResourceScheduleCertificateTest,
+     AuditsComplexNodeRLFrontierAndCPSATPoint) {
+  TestIR ir;
+  ModuloProblem problem(*ir.module);
+  auto multiply = problem.getOrInsertOperatorType("multiply");
+  auto add = problem.getOrInsertOperatorType("add");
+  auto sink = problem.getOrInsertOperatorType("sink");
+  problem.setLatency(multiply, 2);
+  problem.setLatency(add, 1);
+  problem.setLatency(sink, 1);
+  auto multiplier = problem.getOrInsertResourceType("multiplier");
+  auto divider = problem.getOrInsertResourceType("divider");
+  problem.setResourceInitiationInterval(multiplier, 3);
+  problem.setResourceInitiationInterval(divider, 2);
+  problem.setResourceCost(multiplier, 3);
+  problem.setResourceCost(divider, 5);
+
+  struct Tile {
+    std::array<Operation *, 2> products;
+    std::array<Operation *, 2> temporaries;
+    std::array<Operation *, 2> projected;
+    std::array<Operation *, 2> outputs;
+  };
+  std::array<Tile, 4> tiles;
+  auto configure = [&](Operation *op, Problem::OperatorType operatorType,
+                       Problem::ResourceType resource) {
+    problem.insertOperation(op);
+    problem.setLinkedOperatorType(op, operatorType);
+    problem.setLinkedResourceTypes(op, {resource});
+  };
+  for (auto &tile : tiles) {
+    for (unsigned index = 0; index != 2; ++index) {
+      tile.products[index] = ir.createOperation();
+      configure(tile.products[index], multiply, multiplier);
+      tile.temporaries[index] = ir.createOperation();
+      configure(tile.temporaries[index], add, divider);
+      tile.projected[index] = ir.createOperation();
+      configure(tile.projected[index], multiply, multiplier);
+      tile.outputs[index] = ir.createOperation();
+      configure(tile.outputs[index], add, divider);
+    }
+  }
+  auto *last = ir.createOperation();
+  problem.insertOperation(last);
+  problem.setLinkedOperatorType(last, sink);
+
+  auto addDependence = [&](Operation *source, Operation *destination,
+                           unsigned distance = 0) {
+    Problem::Dependence dependence(source, destination);
+    if (failed(problem.insertDependence(dependence)))
+      return failure();
+    if (distance != 0)
+      problem.setDistance(dependence, distance);
+    return success();
+  };
+  for (const auto &tile : tiles) {
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.products[0], tile.temporaries[0])));
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.temporaries[1], tile.temporaries[0], 1)));
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.temporaries[0], tile.projected[0])));
+    ASSERT_TRUE(succeeded(addDependence(tile.projected[0], tile.outputs[0])));
+    ASSERT_TRUE(succeeded(addDependence(tile.outputs[1], tile.outputs[0], 1)));
+
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.products[1], tile.temporaries[1])));
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.temporaries[0], tile.temporaries[1])));
+    ASSERT_TRUE(
+        succeeded(addDependence(tile.temporaries[1], tile.projected[1])));
+    ASSERT_TRUE(succeeded(addDependence(tile.projected[1], tile.outputs[1])));
+    ASSERT_TRUE(succeeded(addDependence(tile.outputs[0], tile.outputs[1])));
+    ASSERT_TRUE(succeeded(addDependence(tile.outputs[1], last)));
+  }
+  ASSERT_TRUE(succeeded(problem.check()));
+
+  SmallVector<ResourceAllocation> allocations;
+  for (unsigned multiplierLimit : {1u, 2u, 4u})
+    for (unsigned dividerLimit : {1u, 2u})
+      allocations.push_back(
+          {{{multiplier, multiplierLimit}, {divider, dividerLimit}}});
+
+  NodeRLSchedulerOptions nodeRLOptions;
+  nodeRLOptions.episodes = 32;
+  nodeRLOptions.seed = 0;
+  auto nodeRLFrontier =
+      exploreNodeRLPareto(problem, last, allocations, nodeRLOptions);
+  ASSERT_TRUE(succeeded(nodeRLFrontier));
+  EXPECT_TRUE(auditStaticFrontier(problem, last, *nodeRLFrontier, 5, 33, 32));
+
+  CPSATSchedulerOptions cpsatOptions;
+  cpsatOptions.timeLimitSeconds = 10.0;
+  cpsatOptions.numWorkers = 4;
+  ArrayRef<ResourceAllocation> exactAllocation(allocations.back());
+  auto cpsatFrontier =
+      exploreCPSATPareto(problem, last, exactAllocation, cpsatOptions);
+  ASSERT_TRUE(succeeded(cpsatFrontier));
+  EXPECT_TRUE(auditStaticFrontier(problem, last, *cpsatFrontier, 1, 33, 32));
+
+  SmallVector<std::tuple<uint64_t, unsigned, unsigned>> exactMetrics;
+  for (const auto &point : *cpsatFrontier)
+    exactMetrics.emplace_back(point.resourceCost, point.initiationInterval,
+                              point.latency);
+  llvm::sort(exactMetrics);
+  SmallVector<std::tuple<uint64_t, unsigned, unsigned>> expectedMetrics = {
+      {22, 16, 17}};
+  EXPECT_EQ(exactMetrics, expectedMetrics);
+}
 
 } // namespace

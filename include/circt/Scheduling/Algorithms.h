@@ -68,7 +68,7 @@ LogicalResult scheduleSimplex(ModuloProblem &prob, Operation *lastOp);
 LogicalResult scheduleSimplex(ChainingProblem &prob, Operation *lastOp,
                               float cycleTime);
 
-/// Solve the resource-free cyclic, chaining-enabled problem using linear
+/// Solve the resource-free cyclic, chaining-enabled problem using a linear
 /// programming-based and a handwritten implementation of the simplex algorithm.
 /// This approach is an hybrid approach of the ChainingProblem simplex scheduler
 /// and the CyclicProblem simplex scheduler. The objectives include determining
@@ -203,6 +203,26 @@ struct NodeRLSchedulerOptions {
   /// disables the limit.
   unsigned resourceOrderingBudget = 1048576;
 
+  /// Number of independent MCTS trees used as a fixed-II feasibility rescue.
+  /// Zero disables the rescue. Trees share a wall-clock and resource-ordering
+  /// budget but use independent random streams.
+  unsigned mctsRescueTrees = 0;
+
+  /// Maximum number of simulations performed by each MCTS rescue tree.
+  unsigned mctsRescueSimulations = 8;
+
+  /// Number of distinct resource conflicts exposed to each MCTS tree node.
+  /// Each conflict contributes both possible ordering orientations.
+  unsigned mctsTreeWidth = 8;
+
+  /// Number of distinct resource conflicts considered at each rollout step.
+  /// This is separate from the retained tree width so inexpensive rollouts can
+  /// use a different action horizon.
+  unsigned mctsRolloutWidth = 8;
+
+  /// Total wall-clock limit for all MCTS rescue attempts in one schedule.
+  double mctsTimeLimitSeconds = 10.0;
+
   /// Re-optimize this many operations around the modulo objective with a
   /// bounded CP-SAT neighborhood after NodeRL finds its smallest feasible II.
   /// Zero disables local search. This requires an OR-Tools-enabled build.
@@ -217,7 +237,7 @@ struct NodeRLSchedulerOptions {
   /// Step size used by the REINFORCE policy update.
   double learningRate = 0.05;
 
-  /// Initial softmax temperature. Higher values explore more actions.
+  /// Initial softmax temperature.  Higher values explore more actions.
   double exploration = 1.0;
 };
 
@@ -320,40 +340,58 @@ exploreCPSATPareto(ModuloProblem &prob, Operation *lastOp,
                    const CPSATSchedulerOptions &options = {});
 
 /// Solve an acyclic resource-constrained problem using node-level
-/// reinforcement learning. The scheduler learns a priority policy over ready
-/// operations and retains the best feasible schedule seen during training. It
+/// reinforcement learning.  The scheduler learns a priority policy over ready
+/// operations and retains the best feasible schedule seen during training.  It
 /// supports operations linked to multiple limited resources.
+///
+/// The objective is to minimize the start time of \p lastOp.  Fails if the
+/// dependence graph contains cycles, \p prob does not include \p lastOp, or the
+/// options are invalid.
 LogicalResult scheduleNodeRL(SharedOperatorsProblem &prob, Operation *lastOp,
                              const NodeRLSchedulerOptions &options = {});
 
 /// Solve a modulo scheduling problem using node-level reinforcement learning.
 /// The scheduler searches increasing initiation intervals, satisfies loop-
 /// carried dependences as cyclic difference constraints, and resolves resource
-/// conflicts with a modulo reservation table.
+/// conflicts with a modulo reservation table.  It supports multiple resources
+/// per operation and resource initiation intervals.  The returned schedule has
+/// the smallest feasible II encountered; among policies at that II it retains
+/// the one with the earliest \p lastOp.
 LogicalResult scheduleNodeRL(ModuloProblem &prob, Operation *lastOp,
                              const NodeRLSchedulerOptions &options = {});
 
 /// Schedule each complete resource allocation with NodeRL and return the
-/// latency/resource-cost Pareto frontier.
+/// latency/resource-cost Pareto frontier. A resource type's cost defaults to
+/// one if it is not set. The problem is left scheduled using the least-cost
+/// point on the returned frontier (breaking ties by latency).
+///
+/// Every allocation must specify each resource type exactly once, and each
+/// requested limit must be non-zero. Fails if an allocation or its schedule is
+/// invalid.
 FailureOr<SmallVector<ResourceParetoPoint>>
 exploreNodeRLPareto(SharedOperatorsProblem &prob, Operation *lastOp,
                     ArrayRef<ResourceAllocation> allocations,
                     const NodeRLSchedulerOptions &options = {});
 
-/// As above, but use a client-provided cost model.
+/// As above, but use a client-provided cost model. This permits clients to use
+/// non-linear or post-synthesis resource-cost estimates.
 FailureOr<SmallVector<ResourceParetoPoint>>
 exploreNodeRLPareto(SharedOperatorsProblem &prob, Operation *lastOp,
                     ArrayRef<ResourceAllocation> allocations,
                     ResourceCostFunction costFunction,
                     const NodeRLSchedulerOptions &options = {});
 
-/// Modulo-scheduling variant of the NodeRL Pareto exploration.
+/// Modulo-scheduling variant of the NodeRL Pareto exploration. Each candidate
+/// is scheduled with cyclic resource constraints; its reported latency is the
+/// start time of \p lastOp and its II is included in the returned point and
+/// stored in the problem left behind by the selected frontier point.
 FailureOr<SmallVector<ResourceParetoPoint>>
 exploreNodeRLPareto(ModuloProblem &prob, Operation *lastOp,
                     ArrayRef<ResourceAllocation> allocations,
                     const NodeRLSchedulerOptions &options = {});
 
-/// As above, but use a client-provided cost model.
+/// As above, but use a client-provided cost model, for example measured
+/// post-synthesis area of an allocation.
 FailureOr<SmallVector<ResourceParetoPoint>>
 exploreNodeRLPareto(ModuloProblem &prob, Operation *lastOp,
                     ArrayRef<ResourceAllocation> allocations,

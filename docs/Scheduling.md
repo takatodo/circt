@@ -329,6 +329,19 @@ improvement with `local-search-nodes` and `local-search-time-limit`.
 `convert-affine-to-loopschedule` exposes corresponding `node-rl-*` options and
 can model a shared multiplier with `multiplier-limit` and `multiplier-ii`.
 
+An optional fixed-II MCTS portfolio can rescue a policy episode that did not
+find a feasible resource ordering. It is disabled by default and bounded by
+independent tree count, simulations, tree/rollout widths, wall time, and the
+same global resource-ordering budget. The corresponding SSP and Affine options
+use the `mcts-*` and `node-rl-mcts-*` prefixes respectively.
+
+The backtracking repair keeps at most 64 live difference-solver snapshots in
+addition to its total explored-state limit. On the 33-operation, two-resource
+frontier audit this changed the pathological allocation from approximately
+1.51 GB peak RSS to 27 MB without changing the returned frontier. CP-SAT is
+still the exact reference for small instances; NodeRL and MCTS are bounded
+heuristics for cases where enumerating exact models becomes expensive.
+
 ### Replayable resource schedules
 
 Resource-allocation exploration returns `ResourceParetoPoint` values carrying

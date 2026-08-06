@@ -16,9 +16,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Scheduling/Algorithms.h"
+#include "circt/Scheduling/Utilities.h"
 
 #include "ResourceSchedule.h"
-#include "circt/Scheduling/Utilities.h"
 
 #include "mlir/IR/Operation.h"
 
@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -625,6 +626,14 @@ struct ModuloConstraint {
   int64_t distance;
 };
 
+using ModuloConstraintKey = std::tuple<unsigned, unsigned, unsigned, int64_t>;
+
+static ModuloConstraintKey
+getConstraintKey(const ModuloConstraint &constraint) {
+  return {constraint.source, constraint.destination, constraint.delay,
+          constraint.distance};
+}
+
 struct ClusterResource {
   Problem::ResourceType resource;
   SmallVector<unsigned> nodes;
@@ -896,6 +905,59 @@ private:
   SmallVector<int64_t> startTimes;
 };
 
+/// A copyable prefix in the fixed-II resource-ordering search. Every state is
+/// already dependence-feasible; adding one action either produces another
+/// exact difference-constraint solution or proves that branch infeasible.
+struct ModuloSearchState {
+  ModuloSearchState(const ModuloCluster &cluster, unsigned ii,
+                    ArrayRef<int64_t> baseStartTimes)
+      : solver(cluster.nodes.size(), ii, cluster.dependenceConstraints,
+               baseStartTimes) {
+    for (const auto &constraint : cluster.dependenceConstraints)
+      constraintKeys.push_back(getConstraintKey(constraint));
+  }
+
+  IncrementalDifferenceSolver solver;
+  SmallVector<ModuloConstraintKey, 16> constraintKeys;
+};
+
+struct MCTSActionCandidate {
+  ModuloConstraint action;
+  uint64_t resourceExcess;
+};
+
+struct RankedResourceConflict {
+  ResourceConflict conflict;
+  unsigned overload;
+  unsigned resourceIndex;
+  unsigned activePhase;
+};
+
+struct MCTSTreeNode {
+  explicit MCTSTreeNode(ModuloSearchState state, unsigned depth = 0)
+      : state(std::move(state)), depth(depth) {}
+
+  ModuloSearchState state;
+  SmallVector<ModuloConstraint, 16> actions;
+  SmallVector<unsigned, 16> children;
+  unsigned nextAction = 0;
+  unsigned visits = 0;
+  double totalReward = 0.0;
+  unsigned depth = 0;
+  bool actionsReady = false;
+  bool feasible = false;
+  bool deadEnd = false;
+};
+
+struct MCTSTree {
+  MCTSTree(const ModuloSearchState &root, uint64_t seed) : rng(seed) {
+    nodes.emplace_back(root);
+  }
+
+  SmallVector<MCTSTreeNode, 8> nodes;
+  std::mt19937_64 rng;
+};
+
 struct ModuloClusterEpisode {
   SmallVector<int64_t> startTimes;
   FeatureVector policyGradient{};
@@ -920,6 +982,13 @@ public:
   LogicalResult schedule();
 
 private:
+  // Backtracking copies an incremental solver at each branch, so keep it as a
+  // bounded repair for small ambiguous clusters. Larger clusters retain the
+  // linear-memory policy path.
+  static constexpr unsigned maxBacktrackingClusterSize = 32;
+  static constexpr unsigned maxBacktrackingStates = 16384;
+  static constexpr unsigned maxBacktrackingLiveStates = 64;
+
   ModuloProblem &prob;
   Operation *lastOp;
   const NodeRLSchedulerOptions &options;
@@ -941,33 +1010,62 @@ private:
   bool solveDifferenceConstraints(ArrayRef<ModuloConstraint> constraints,
                                   unsigned numNodes, unsigned ii,
                                   SmallVectorImpl<int64_t> &startTimes) const;
-  std::optional<ModuloConstraint>
-  chooseResourceConstraint(const ModuloCluster &cluster,
-                           ArrayRef<int64_t> startTimes, unsigned ii,
-                           const FeatureVector &weights, bool stochastic,
-                           double temperature, ModuloClusterEpisode &episode);
+  std::optional<ModuloConstraint> chooseResourceConstraint(
+      const ModuloCluster &cluster, ArrayRef<int64_t> startTimes, unsigned ii,
+      const FeatureVector &weights, bool stochastic, double temperature,
+      bool wrapAround, ModuloClusterEpisode &episode);
   ModuloConstraint
   orderResourceConflict(const ModuloCluster &cluster, ResourceConflict conflict,
                         ArrayRef<int64_t> startTimes, unsigned ii,
                         const FeatureVector &weights, bool stochastic,
-                        double temperature, ModuloClusterEpisode &episode);
+                        double temperature, bool wrapAround,
+                        ModuloClusterEpisode &episode);
   bool shouldTrackReservations(const ModuloCluster &cluster) const;
   bool bindResources(ArrayRef<int64_t> startTimes, unsigned ii);
   ModuloClusterEpisode runClusterEpisode(const ModuloCluster &cluster,
                                          unsigned ii,
                                          ArrayRef<int64_t> baseStartTimes,
                                          const FeatureVector &weights,
-                                         bool stochastic, double temperature);
+                                         bool stochastic, double temperature,
+                                         bool wrapAround, bool backtracking);
+  ModuloClusterEpisode
+  tryBacktrackingResourceOrdering(const ModuloCluster &cluster, unsigned ii,
+                                  ArrayRef<int64_t> baseStartTimes,
+                                  const FeatureVector &weights);
   ModuloClusterEpisode tryBulkResourceOrdering(const ModuloCluster &cluster,
                                                unsigned ii,
                                                ArrayRef<int64_t> baseStartTimes,
                                                const FeatureVector &weights,
                                                bool stochastic,
                                                double temperature);
+  uint64_t countResourceExcess(const ModuloCluster &cluster,
+                               ArrayRef<int64_t> startTimes, unsigned ii) const;
+  ModuloConstraint
+  orderResourceConflictAlternative(ResourceConflict conflict,
+                                   ArrayRef<int64_t> startTimes, unsigned ii,
+                                   bool alternative) const;
+  bool applyMCTSAction(ModuloSearchState &state,
+                       const ModuloConstraint &action);
+  bool collectMCTSActions(const ModuloCluster &cluster,
+                          const ModuloSearchState &state, unsigned ii,
+                          unsigned conflictWidth, bool maskIllegal,
+                          SmallVectorImpl<ModuloConstraint> &actions);
+  void packTightUnitCapacityResources(
+      const ModuloCluster &cluster, unsigned ii, ModuloSearchState &state,
+      std::chrono::steady_clock::time_point deadline);
+  ModuloClusterEpisode
+  tryMCTSResourceOrdering(const ModuloCluster &cluster, unsigned ii,
+                          ArrayRef<int64_t> baseStartTimes,
+                          std::chrono::steady_clock::time_point deadline);
+  ModuloEpisode
+  runMCTSRescue(unsigned ii,
+                ArrayRef<SmallVector<int64_t>> clusterBaseStartTimes,
+                std::chrono::steady_clock::time_point deadline);
   ModuloEpisode runEpisode(unsigned ii,
                            ArrayRef<SmallVector<int64_t>> clusterBaseStartTimes,
                            const FeatureVector &weights, bool stochastic,
-                           double temperature);
+                           double temperature, bool wrapAround,
+                           bool backtracking);
   bool solveClusterDependences(
       unsigned ii,
       SmallVectorImpl<SmallVector<int64_t>> &clusterStartTimes) const;
@@ -1331,9 +1429,11 @@ bool ModuloNodeRLScheduler::solveDifferenceConstraints(
 ModuloConstraint ModuloNodeRLScheduler::orderResourceConflict(
     const ModuloCluster &cluster, ResourceConflict conflict,
     ArrayRef<int64_t> startTimes, unsigned ii, const FeatureVector &weights,
-    bool stochastic, double temperature, ModuloClusterEpisode &episode) {
+    bool stochastic, double temperature, bool wrapAround,
+    ModuloClusterEpisode &episode) {
   unsigned source = conflict.source;
   unsigned destination = conflict.destination;
+  bool advanceAcrossWrap = false;
   if (conflict.sourcePhase == conflict.destinationPhase) {
     SmallVector<double> scores;
     for (unsigned node : {source, destination}) {
@@ -1361,13 +1461,16 @@ ModuloConstraint ModuloNodeRLScheduler::orderResourceConflict(
       }
       ++episode.decisions;
     }
+    if (wrapAround && !stochastic)
+      selected = 1 - selected;
     if (selected == 1)
       std::swap(source, destination);
   } else {
     // The reservation windows overlap even though their start phases differ.
-    // Direct the edge across the shorter, conflicting circular gap. An edge
-    // across the other gap would already be satisfied and rediscover the same
-    // conflict without moving either phase.
+    // The ordinary repair advances across the shorter, conflicting circular
+    // gap. A fallback episode may instead reverse this individual ordering
+    // and advance across the modulo boundary. Sampling per conflict permits a
+    // schedule to mix both orientations instead of choosing one globally.
     unsigned sourcePhase = static_cast<uint64_t>(startTimes[source]) % ii;
     unsigned destinationPhase =
         static_cast<uint64_t>(startTimes[destination]) % ii;
@@ -1375,6 +1478,17 @@ ModuloConstraint ModuloNodeRLScheduler::orderResourceConflict(
         (static_cast<uint64_t>(destinationPhase) + ii - sourcePhase) % ii;
     if (forward >= conflict.resourceII)
       std::swap(source, destination);
+
+    bool reverseOrdering = wrapAround;
+    if (wrapAround && stochastic) {
+      std::bernoulli_distribution distribution(0.5);
+      reverseOrdering = distribution(rng);
+      ++episode.decisions;
+    }
+    if (reverseOrdering) {
+      std::swap(source, destination);
+      advanceAcrossWrap = true;
+    }
   }
 
   // Absolute start times may differ by whole IIs while their phases alias. A
@@ -1387,6 +1501,8 @@ ModuloConstraint ModuloNodeRLScheduler::orderResourceConflict(
   int64_t iterationDelta = difference / static_cast<int64_t>(ii);
   if (difference < 0 && difference % static_cast<int64_t>(ii) != 0)
     --iterationDelta;
+  if (advanceAcrossWrap)
+    ++iterationDelta;
   return ModuloConstraint{source, destination, conflict.resourceII,
                           -iterationDelta};
 }
@@ -1424,7 +1540,7 @@ bool ModuloNodeRLScheduler::consumeResourceOrdering() {
 std::optional<ModuloConstraint> ModuloNodeRLScheduler::chooseResourceConstraint(
     const ModuloCluster &cluster, ArrayRef<int64_t> startTimes, unsigned ii,
     const FeatureVector &weights, bool stochastic, double temperature,
-    ModuloClusterEpisode &episode) {
+    bool wrapAround, ModuloClusterEpisode &episode) {
   for (const auto &resourceUse : cluster.resources) {
     auto resource = resourceUse.resource;
     auto limit = prob.getLimit(resource).value_or(0);
@@ -1449,7 +1565,8 @@ std::optional<ModuloConstraint> ModuloNodeRLScheduler::chooseResourceConstraint(
           cluster,
           {source, destination, static_cast<unsigned>(startTimes[source] % ii),
            static_cast<unsigned>(startTimes[destination] % ii), resourceII},
-          startTimes, ii, weights, stochastic, temperature, episode);
+          startTimes, ii, weights, stochastic, temperature, wrapAround,
+          episode);
     }
   }
   return std::nullopt;
@@ -1600,9 +1717,494 @@ ModuloClusterEpisode ModuloNodeRLScheduler::tryBulkResourceOrdering(
   return episode;
 }
 
+uint64_t
+ModuloNodeRLScheduler::countResourceExcess(const ModuloCluster &cluster,
+                                           ArrayRef<int64_t> startTimes,
+                                           unsigned ii) const {
+  uint64_t excess = 0;
+  SmallVector<unsigned> occupancy(ii);
+  for (const auto &resourceUse : cluster.resources) {
+    llvm::fill(occupancy, 0);
+    unsigned limit = *prob.getLimit(resourceUse.resource);
+    unsigned resourceII =
+        prob.getResourceInitiationInterval(resourceUse.resource).value_or(1);
+    for (unsigned node : resourceUse.nodes) {
+      assert(startTimes[node] >= 0 &&
+             "difference solution must be nonnegative");
+      unsigned phase = static_cast<uint64_t>(startTimes[node]) % ii;
+      for (unsigned offset = 0; offset != resourceII; ++offset)
+        ++occupancy[(static_cast<uint64_t>(phase) + offset) % ii];
+    }
+    for (unsigned active : occupancy)
+      if (active > limit)
+        excess += active - limit;
+  }
+  return excess;
+}
+
+ModuloConstraint ModuloNodeRLScheduler::orderResourceConflictAlternative(
+    ResourceConflict conflict, ArrayRef<int64_t> startTimes, unsigned ii,
+    bool alternative) const {
+  unsigned source = conflict.source;
+  unsigned destination = conflict.destination;
+  bool advanceAcrossWrap = false;
+  if (conflict.sourcePhase == conflict.destinationPhase) {
+    if (alternative)
+      std::swap(source, destination);
+  } else {
+    unsigned sourcePhase = static_cast<uint64_t>(startTimes[source]) % ii;
+    unsigned destinationPhase =
+        static_cast<uint64_t>(startTimes[destination]) % ii;
+    unsigned forward =
+        (static_cast<uint64_t>(destinationPhase) + ii - sourcePhase) % ii;
+    if (forward >= conflict.resourceII)
+      std::swap(source, destination);
+    if (alternative) {
+      std::swap(source, destination);
+      advanceAcrossWrap = true;
+    }
+  }
+
+  int64_t difference = startTimes[destination] - startTimes[source];
+  int64_t iterationDelta = difference / static_cast<int64_t>(ii);
+  if (difference < 0 && difference % static_cast<int64_t>(ii) != 0)
+    --iterationDelta;
+  if (advanceAcrossWrap)
+    ++iterationDelta;
+  return {source, destination, conflict.resourceII, -iterationDelta};
+}
+
+bool ModuloNodeRLScheduler::applyMCTSAction(ModuloSearchState &state,
+                                            const ModuloConstraint &action) {
+  ModuloConstraintKey key = getConstraintKey(action);
+  if (llvm::is_contained(state.constraintKeys, key))
+    return false;
+  if (!consumeResourceOrdering())
+    return false;
+  state.constraintKeys.push_back(key);
+  return state.solver.addConstraint(action);
+}
+
+bool ModuloNodeRLScheduler::collectMCTSActions(
+    const ModuloCluster &cluster, const ModuloSearchState &state, unsigned ii,
+    unsigned conflictWidth, bool maskIllegal,
+    SmallVectorImpl<ModuloConstraint> &actions) {
+  actions.clear();
+  SmallVector<RankedResourceConflict, 16> conflicts;
+  llvm::SmallDenseSet<std::tuple<unsigned, unsigned, unsigned>, 16> seenPairs;
+  auto startTimes = state.solver.getStartTimes();
+  for (auto [resourceIndex, resourceUse] : llvm::enumerate(cluster.resources)) {
+    unsigned limit = *prob.getLimit(resourceUse.resource);
+    unsigned resourceII =
+        prob.getResourceInitiationInterval(resourceUse.resource).value_or(1);
+    SmallVector<SmallVector<unsigned, 4>> reservations(ii);
+    for (unsigned node : resourceUse.nodes) {
+      unsigned phase = static_cast<uint64_t>(startTimes[node]) % ii;
+      for (unsigned offset = 0; offset != resourceII; ++offset)
+        reservations[(static_cast<uint64_t>(phase) + offset) % ii].push_back(
+            node);
+    }
+    for (auto [activePhase, active] : llvm::enumerate(reservations)) {
+      if (active.size() <= limit)
+        continue;
+      llvm::sort(active, [&](unsigned lhs, unsigned rhs) {
+        return std::make_tuple(startTimes[lhs] % ii, cluster.nodes[lhs]) <
+               std::make_tuple(startTimes[rhs] % ii, cluster.nodes[rhs]);
+      });
+      unsigned source = active[0], destination = active[1];
+      auto pairKey = std::make_tuple(static_cast<unsigned>(resourceIndex),
+                                     std::min(source, destination),
+                                     std::max(source, destination));
+      if (!seenPairs.insert(pairKey).second)
+        continue;
+      conflicts.push_back(
+          {{source, destination, static_cast<unsigned>(startTimes[source] % ii),
+            static_cast<unsigned>(startTimes[destination] % ii), resourceII},
+           static_cast<unsigned>(active.size() - limit),
+           static_cast<unsigned>(resourceIndex),
+           static_cast<unsigned>(activePhase)});
+    }
+  }
+  if (conflicts.empty())
+    return true;
+
+  // Width one is the existing first-conflict policy. Wider searches retain
+  // that baseline action and add the most overloaded alternatives.
+  if (conflicts.size() > 1)
+    llvm::sort(conflicts.begin() + 1, conflicts.end(),
+               [](const RankedResourceConflict &lhs,
+                  const RankedResourceConflict &rhs) {
+                 if (lhs.overload != rhs.overload)
+                   return lhs.overload > rhs.overload;
+                 if (lhs.conflict.resourceII != rhs.conflict.resourceII)
+                   return lhs.conflict.resourceII > rhs.conflict.resourceII;
+                 return std::tie(lhs.resourceIndex, lhs.activePhase,
+                                 lhs.conflict.source,
+                                 lhs.conflict.destination) <
+                        std::tie(rhs.resourceIndex, rhs.activePhase,
+                                 rhs.conflict.source, rhs.conflict.destination);
+               });
+  if (conflicts.size() > conflictWidth)
+    conflicts.resize(conflictWidth);
+
+  llvm::SmallDenseSet<ModuloConstraintKey, 16> actionKeys;
+  for (const auto &ranked : conflicts) {
+    for (bool alternative : {false, true}) {
+      ModuloConstraint action = orderResourceConflictAlternative(
+          ranked.conflict, startTimes, ii, alternative);
+      ModuloConstraintKey key = getConstraintKey(action);
+      if (llvm::is_contained(state.constraintKeys, key) ||
+          !actionKeys.insert(key).second)
+        continue;
+      actions.push_back(action);
+    }
+  }
+  if (!maskIllegal)
+    return false;
+
+  SmallVector<MCTSActionCandidate, 16> candidates;
+  for (const auto &action : actions) {
+    ModuloSearchState child = state;
+    if (!applyMCTSAction(child, action)) {
+      if (resourceOrderingBudgetExhausted) {
+        actions.clear();
+        return false;
+      }
+      continue;
+    }
+    candidates.push_back(
+        {action,
+         countResourceExcess(cluster, child.solver.getStartTimes(), ii)});
+  }
+  llvm::stable_sort(candidates, [](const MCTSActionCandidate &lhs,
+                                   const MCTSActionCandidate &rhs) {
+    return lhs.resourceExcess < rhs.resourceExcess;
+  });
+  actions.clear();
+  for (const auto &candidate : candidates)
+    actions.push_back(candidate.action);
+  return false;
+}
+
+void ModuloNodeRLScheduler::packTightUnitCapacityResources(
+    const ModuloCluster &cluster, unsigned ii, ModuloSearchState &state,
+    std::chrono::steady_clock::time_point deadline) {
+  for (const auto &resourceUse : cluster.resources) {
+    if (std::chrono::steady_clock::now() >= deadline ||
+        resourceOrderingBudgetExhausted)
+      return;
+    if (prob.getLimit(resourceUse.resource).value_or(0) != 1)
+      continue;
+    unsigned resourceII =
+        prob.getResourceInitiationInterval(resourceUse.resource).value_or(1);
+    if (resourceUse.nodes.empty() ||
+        static_cast<uint64_t>(resourceUse.nodes.size()) * resourceII != ii)
+      continue;
+
+    ModuloSearchState packed = state;
+    SmallVector<unsigned> order(resourceUse.nodes.begin(),
+                                resourceUse.nodes.end());
+    auto startTimes = packed.solver.getStartTimes();
+    llvm::stable_sort(order, [&](unsigned lhs, unsigned rhs) {
+      unsigned lhsPhase = static_cast<uint64_t>(startTimes[lhs]) % ii;
+      unsigned rhsPhase = static_cast<uint64_t>(startTimes[rhs]) % ii;
+      return std::tie(lhsPhase, startTimes[lhs], cluster.nodes[lhs]) <
+             std::tie(rhsPhase, startTimes[rhs], cluster.nodes[rhs]);
+    });
+
+    bool feasible = true;
+    for (unsigned index = 0, e = order.size(); index != e; ++index) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        feasible = false;
+        break;
+      }
+      ModuloConstraint ordering{order[index], order[(index + 1) % e],
+                                resourceII, index + 1 == e ? 1 : 0};
+      if (llvm::is_contained(packed.constraintKeys, getConstraintKey(ordering)))
+        continue;
+      if (!applyMCTSAction(packed, ordering)) {
+        feasible = false;
+        break;
+      }
+    }
+    if (feasible)
+      state = std::move(packed);
+  }
+}
+
+ModuloClusterEpisode ModuloNodeRLScheduler::tryMCTSResourceOrdering(
+    const ModuloCluster &cluster, unsigned ii, ArrayRef<int64_t> baseStartTimes,
+    std::chrono::steady_clock::time_point deadline) {
+  ModuloClusterEpisode episode;
+  ModuloSearchState root(cluster, ii, baseStartTimes);
+  packTightUnitCapacityResources(cluster, ii, root, deadline);
+  if (std::chrono::steady_clock::now() >= deadline ||
+      resourceOrderingBudgetExhausted)
+    return episode;
+
+  uint64_t rootExcess =
+      countResourceExcess(cluster, root.solver.getStartTimes(), ii);
+  if (rootExcess == 0) {
+    episode.startTimes.assign(root.solver.getStartTimes().begin(),
+                              root.solver.getStartTimes().end());
+    episode.feasible = true;
+    return episode;
+  }
+
+  SmallVector<MCTSTree, 3> trees;
+  trees.reserve(options.mctsRescueTrees);
+  for (unsigned tree = 0; tree != options.mctsRescueTrees; ++tree) {
+    constexpr uint64_t goldenRatio = 0x9e3779b97f4a7c15ULL;
+    trees.emplace_back(root, options.seed + goldenRatio * (tree + 1));
+    trees.back().nodes.reserve(options.mctsRescueSimulations + 1);
+  }
+  uint64_t rolloutLimit = std::max<uint64_t>(8, cluster.nodes.size() * 8);
+  rolloutLimit =
+      std::min<uint64_t>(rolloutLimit, std::numeric_limits<unsigned>::max());
+
+  auto runSimulation = [&](MCTSTree &tree) {
+    unsigned nodeIndex = 0;
+    SmallVector<unsigned, 16> path{nodeIndex};
+    while (true) {
+      if (std::chrono::steady_clock::now() >= deadline ||
+          resourceOrderingBudgetExhausted)
+        return false;
+      auto &node = tree.nodes[nodeIndex];
+      if (!node.actionsReady) {
+        node.feasible = collectMCTSActions(
+            cluster, node.state, ii, options.mctsTreeWidth, true, node.actions);
+        node.actionsReady = true;
+        node.deadEnd = !node.feasible && node.actions.empty();
+      }
+      if (node.feasible) {
+        episode.startTimes.assign(node.state.solver.getStartTimes().begin(),
+                                  node.state.solver.getStartTimes().end());
+        episode.feasible = true;
+        return true;
+      }
+      if (node.deadEnd)
+        break;
+
+      unsigned widenedActions = std::min<unsigned>(
+          node.actions.size(),
+          std::max(2u,
+                   2u * static_cast<unsigned>(std::sqrt(node.visits + 1.0))));
+      if (node.nextAction != widenedActions) {
+        ModuloConstraint action = node.actions[node.nextAction++];
+        ModuloSearchState childState = node.state;
+        bool legal = applyMCTSAction(childState, action);
+        if (resourceOrderingBudgetExhausted)
+          return false;
+        unsigned childIndex = tree.nodes.size();
+        unsigned childDepth = node.depth + 1;
+        node.children.push_back(childIndex);
+        tree.nodes.emplace_back(std::move(childState), childDepth);
+        tree.nodes.back().deadEnd = !legal;
+        nodeIndex = childIndex;
+        path.push_back(nodeIndex);
+        break;
+      }
+
+      double bestScore = -std::numeric_limits<double>::infinity();
+      unsigned selectedChild = node.children.front();
+      double logParent = std::log(static_cast<double>(node.visits) + 1.0);
+      for (unsigned childIndex : node.children) {
+        const auto &child = tree.nodes[childIndex];
+        double score =
+            child.visits == 0
+                ? std::numeric_limits<double>::infinity()
+                : child.totalReward / child.visits +
+                      std::sqrt(2.0) * std::sqrt(logParent / child.visits);
+        if (score > bestScore) {
+          bestScore = score;
+          selectedChild = childIndex;
+        }
+      }
+      nodeIndex = selectedChild;
+      path.push_back(nodeIndex);
+    }
+
+    double reward = 0.0;
+    if (!tree.nodes[nodeIndex].deadEnd) {
+      ModuloSearchState rollout = tree.nodes[nodeIndex].state;
+      bool rolloutDeadEnd = false;
+      uint64_t rolloutBestExcess =
+          countResourceExcess(cluster, rollout.solver.getStartTimes(), ii);
+      for (unsigned step = 0; step != rolloutLimit; ++step) {
+        if (std::chrono::steady_clock::now() >= deadline ||
+            resourceOrderingBudgetExhausted)
+          return false;
+        SmallVector<ModuloConstraint, 16> actions;
+        bool feasible = collectMCTSActions(
+            cluster, rollout, ii, options.mctsRolloutWidth, false, actions);
+        if (feasible) {
+          episode.startTimes.assign(rollout.solver.getStartTimes().begin(),
+                                    rollout.solver.getStartTimes().end());
+          episode.feasible = true;
+          return true;
+        }
+        // Keep rollout-mode selection on an RNG stream separate from action
+        // shuffling. The current policy is fully random, but retaining this
+        // draw keeps portfolio seeds stable if a greedy mode is reintroduced.
+        std::bernoulli_distribution chooseGreedy(0.0);
+        (void)chooseGreedy(tree.rng);
+        std::shuffle(actions.begin(), actions.end(), tree.rng);
+        bool advanced = false;
+        for (const auto &action : actions) {
+          ModuloSearchState child = rollout;
+          if (applyMCTSAction(child, action)) {
+            rollout = std::move(child);
+            advanced = true;
+            break;
+          }
+          if (resourceOrderingBudgetExhausted)
+            return false;
+        }
+        if (!advanced) {
+          rolloutDeadEnd = true;
+          break;
+        }
+        rolloutBestExcess = std::min(
+            rolloutBestExcess,
+            countResourceExcess(cluster, rollout.solver.getStartTimes(), ii));
+      }
+      double progress =
+          1.0 - static_cast<double>(std::min(rootExcess, rolloutBestExcess)) /
+                    rootExcess;
+      double denseReward = 0.95 * progress + 0.05 / (1.0 + rolloutBestExcess);
+      reward = (rolloutDeadEnd ? 0.1 : 1.0) * denseReward;
+    }
+    for (unsigned visited : path) {
+      ++tree.nodes[visited].visits;
+      tree.nodes[visited].totalReward += reward;
+    }
+    return false;
+  };
+
+  // Interleave the independent trees. This preserves portfolio diversity
+  // under one wall-clock bound instead of allowing an unlucky first tree to
+  // consume the entire rescue budget.
+  for (unsigned simulation = 0; simulation != options.mctsRescueSimulations;
+       ++simulation)
+    for (auto &tree : trees) {
+      if (runSimulation(tree))
+        return episode;
+      if (std::chrono::steady_clock::now() >= deadline ||
+          resourceOrderingBudgetExhausted)
+        return episode;
+    }
+  return episode;
+}
+
+ModuloEpisode ModuloNodeRLScheduler::runMCTSRescue(
+    unsigned ii, ArrayRef<SmallVector<int64_t>> clusterBaseStartTimes,
+    std::chrono::steady_clock::time_point deadline) {
+  ModuloEpisode episode;
+  SmallVector<SmallVector<int64_t>> clusterStartTimes;
+  clusterStartTimes.reserve(clusters.size());
+  for (auto [clusterIndex, cluster] : llvm::enumerate(clusters)) {
+    ModuloClusterEpisode clusterEpisode = tryMCTSResourceOrdering(
+        cluster, ii, clusterBaseStartTimes[clusterIndex], deadline);
+    if (!clusterEpisode.feasible)
+      return episode;
+    clusterStartTimes.push_back(std::move(clusterEpisode.startTimes));
+  }
+  combineClusterSchedules(ii, clusterStartTimes, episode);
+  return episode;
+}
+
+ModuloClusterEpisode ModuloNodeRLScheduler::tryBacktrackingResourceOrdering(
+    const ModuloCluster &cluster, unsigned ii, ArrayRef<int64_t> baseStartTimes,
+    const FeatureVector &weights) {
+  ModuloClusterEpisode episode;
+  if (cluster.nodes.size() > maxBacktrackingClusterSize)
+    return episode;
+
+  struct SearchState {
+    SearchState(const ModuloCluster &cluster, unsigned ii,
+                ArrayRef<int64_t> baseStartTimes)
+        : solver(cluster.nodes.size(), ii, cluster.dependenceConstraints,
+                 baseStartTimes) {
+      for (const auto &constraint : cluster.dependenceConstraints)
+        constraintKeys.emplace_back(constraint.source, constraint.destination,
+                                    constraint.delay, constraint.distance);
+    }
+
+    IncrementalDifferenceSolver solver;
+    SmallVector<ModuloConstraintKey, 16> constraintKeys;
+  };
+
+  SmallVector<SearchState, 16> stack;
+  stack.emplace_back(cluster, ii, baseStartTimes);
+  uint64_t clusterSize = cluster.nodes.size();
+  unsigned stateBudget = static_cast<unsigned>(std::min<uint64_t>(
+      maxBacktrackingStates,
+      std::max<uint64_t>(64, clusterSize * clusterSize * 32)));
+  for (unsigned explored = 0; !stack.empty() && explored != stateBudget;
+       ++explored) {
+    SearchState state = std::move(stack.back());
+    stack.pop_back();
+
+    SmallVector<ModuloConstraint, 2> alternatives;
+    for (bool wrapAround : {false, true}) {
+      ModuloClusterEpisode decision;
+      auto constraint =
+          chooseResourceConstraint(cluster, state.solver.getStartTimes(), ii,
+                                   weights, false, 1.0, wrapAround, decision);
+      if (!constraint) {
+        episode.startTimes.assign(state.solver.getStartTimes().begin(),
+                                  state.solver.getStartTimes().end());
+        episode.feasible = true;
+        return episode;
+      }
+      ModuloConstraintKey key{constraint->source, constraint->destination,
+                              constraint->delay, constraint->distance};
+      if (llvm::none_of(alternatives, [&](const ModuloConstraint &other) {
+            return key == ModuloConstraintKey{other.source, other.destination,
+                                              other.delay, other.distance};
+          }))
+        alternatives.push_back(*constraint);
+    }
+
+    // A depth-first search can retain one sibling at every level. Since each
+    // sibling owns a complete incremental solver, an unlucky 32-node problem
+    // can otherwise keep thousands of increasingly large solver copies alive.
+    // Retain a bounded frontier and prefer the nearest-conflict orientation
+    // whenever only one slot remains.
+    assert(stack.size() < maxBacktrackingLiveStates &&
+           "backtracking frontier must remain bounded");
+    unsigned availableStates = maxBacktrackingLiveStates - stack.size();
+    SmallVector<SearchState, 2> children;
+    for (const auto &constraint : alternatives) {
+      ModuloConstraintKey key{constraint.source, constraint.destination,
+                              constraint.delay, constraint.distance};
+      if (llvm::is_contained(state.constraintKeys, key))
+        continue;
+      if (!consumeResourceOrdering())
+        return episode;
+      SearchState child = state;
+      child.constraintKeys.push_back(key);
+      if (!child.solver.addConstraint(constraint))
+        continue;
+      children.push_back(std::move(child));
+      if (children.size() == availableStates)
+        break;
+    }
+    // Push the opposite branch first so the preferred child is popped next.
+    for (auto &child : llvm::reverse(children))
+      stack.push_back(std::move(child));
+  }
+  return episode;
+}
+
 ModuloClusterEpisode ModuloNodeRLScheduler::runClusterEpisode(
     const ModuloCluster &cluster, unsigned ii, ArrayRef<int64_t> baseStartTimes,
-    const FeatureVector &weights, bool stochastic, double temperature) {
+    const FeatureVector &weights, bool stochastic, double temperature,
+    bool wrapAround, bool backtracking) {
+  if (backtracking && cluster.nodes.size() <= maxBacktrackingClusterSize)
+    return tryBacktrackingResourceOrdering(cluster, ii, baseStartTimes,
+                                           weights);
+  wrapAround &= cluster.nodes.size() <= maxBacktrackingClusterSize;
   if (shouldTrackReservations(cluster)) {
     ModuloClusterEpisode bulk = tryBulkResourceOrdering(
         cluster, ii, baseStartTimes, weights, stochastic, temperature);
@@ -1631,12 +2233,13 @@ ModuloClusterEpisode ModuloNodeRLScheduler::runClusterEpisode(
     std::optional<ModuloConstraint> conflict;
     if (reservationState) {
       if (auto resourceConflict = reservationState->findConflict())
-        conflict =
-            orderResourceConflict(cluster, *resourceConflict, startTimes, ii,
-                                  weights, stochastic, temperature, episode);
+        conflict = orderResourceConflict(cluster, *resourceConflict, startTimes,
+                                         ii, weights, stochastic, temperature,
+                                         wrapAround, episode);
     } else {
-      conflict = chooseResourceConstraint(cluster, startTimes, ii, weights,
-                                          stochastic, temperature, episode);
+      conflict =
+          chooseResourceConstraint(cluster, startTimes, ii, weights, stochastic,
+                                   temperature, wrapAround, episode);
     }
     if (!conflict) {
       episode.startTimes.assign(startTimes.begin(), startTimes.end());
@@ -1714,16 +2317,17 @@ void ModuloNodeRLScheduler::combineClusterSchedules(
 
 ModuloEpisode ModuloNodeRLScheduler::runEpisode(
     unsigned ii, ArrayRef<SmallVector<int64_t>> clusterBaseStartTimes,
-    const FeatureVector &weights, bool stochastic, double temperature) {
+    const FeatureVector &weights, bool stochastic, double temperature,
+    bool wrapAround, bool backtracking) {
   assert(clusterBaseStartTimes.size() == clusters.size() &&
          "missing base schedule for a cluster");
   ModuloEpisode episode;
   SmallVector<SmallVector<int64_t>> clusterStartTimes;
   clusterStartTimes.reserve(clusters.size());
   for (auto [clusterIndex, cluster] : llvm::enumerate(clusters)) {
-    ModuloClusterEpisode clusterEpisode =
-        runClusterEpisode(cluster, ii, clusterBaseStartTimes[clusterIndex],
-                          weights, stochastic, temperature);
+    ModuloClusterEpisode clusterEpisode = runClusterEpisode(
+        cluster, ii, clusterBaseStartTimes[clusterIndex], weights, stochastic,
+        temperature, wrapAround, backtracking);
     episode.decisions += clusterEpisode.decisions;
     for (unsigned feature = 0; feature != NumFeatures; ++feature)
       episode.policyGradient[feature] += clusterEpisode.policyGradient[feature];
@@ -1771,6 +2375,13 @@ LogicalResult ModuloNodeRLScheduler::schedule() {
       !std::isfinite(options.exploration) || options.exploration <= 0.0)
     return prob.getContainingOp()->emitError(
         "node-rl options must be finite and positive");
+  if (options.mctsRescueTrees != 0 &&
+      (options.mctsRescueSimulations == 0 || options.mctsTreeWidth == 0 ||
+       options.mctsRolloutWidth == 0 ||
+       !std::isfinite(options.mctsTimeLimitSeconds) ||
+       options.mctsTimeLimitSeconds <= 0.0))
+    return prob.getContainingOp()->emitError(
+        "node-rl MCTS rescue options must be finite and positive");
   if (options.localSearchNodes != 0 &&
       (!std::isfinite(options.localSearchTimeLimitSeconds) ||
        options.localSearchTimeLimitSeconds <= 0.0))
@@ -1824,11 +2435,46 @@ LogicalResult ModuloNodeRLScheduler::schedule() {
 
   FeatureVector weights = {0.0, 3.0, 2.0, 1.0, 0.5, 0.5, 0.5, 0.25};
   unsigned episodePatience = computeEpisodePatience();
+  bool hasSmallResourceCluster =
+      llvm::any_of(clusters, [](const auto &cluster) {
+        return !cluster.resources.empty() &&
+               cluster.nodes.size() <= maxBacktrackingClusterSize;
+      });
+  auto mctsDeadline = std::chrono::steady_clock::time_point::min();
+  if (options.mctsRescueTrees != 0)
+    mctsDeadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(options.mctsTimeLimitSeconds));
   for (unsigned ii = lowerBound; ii <= upperBound; ++ii) {
     SmallVector<SmallVector<int64_t>> baseStartTimes;
     if (!solveClusterDependences(ii, baseStartTimes))
       continue;
-    ModuloEpisode best = runEpisode(ii, baseStartTimes, weights, false, 1.0);
+    ModuloEpisode best =
+        runEpisode(ii, baseStartTimes, weights, false, 1.0, false, false);
+    if (hasSmallResourceCluster && !best.feasible &&
+        !resourceOrderingBudgetExhausted) {
+      ModuloEpisode wrapped =
+          runEpisode(ii, baseStartTimes, weights, false, 1.0, true, false);
+      if (wrapped.feasible)
+        best = std::move(wrapped);
+    }
+    if (hasSmallResourceCluster && !best.feasible &&
+        !resourceOrderingBudgetExhausted) {
+      ModuloEpisode backtracked =
+          runEpisode(ii, baseStartTimes, weights, false, 1.0, false, true);
+      if (backtracked.feasible)
+        best = std::move(backtracked);
+    }
+    if (options.mctsRescueTrees != 0 && !best.feasible &&
+        !resourceOrderingBudgetExhausted &&
+        std::chrono::steady_clock::now() < mctsDeadline) {
+      ModuloEpisode rescued = runMCTSRescue(ii, baseStartTimes, mctsDeadline);
+      if (rescued.feasible) {
+        LLVM_DEBUG(llvm::dbgs() << "node-rl MCTS rescued II=" << ii << "\n");
+        best = std::move(rescued);
+      }
+    }
     if (resourceOrderingBudgetExhausted && !best.feasible)
       return prob.getContainingOp()->emitError()
              << "node-rl exhausted its resource-ordering budget of "
@@ -1845,7 +2491,8 @@ LogicalResult ModuloNodeRLScheduler::schedule() {
       double temperature =
           std::max(0.05, options.exploration * std::pow(0.1, progress));
       ModuloEpisode sample =
-          runEpisode(ii, baseStartTimes, weights, true, temperature);
+          runEpisode(ii, baseStartTimes, weights, true, temperature,
+                     hasSmallResourceCluster && !best.feasible, false);
       if (resourceOrderingBudgetExhausted) {
         if (!best.feasible)
           return prob.getContainingOp()->emitError()
