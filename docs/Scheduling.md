@@ -266,8 +266,9 @@ as well as redundant iteration over the problem components.
   assumed to be fully pipelined.
 - [SharedOperatorsProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1SharedOperatorsProblem.html):
   A resource-constrained scheduling problem that corresponds to multiplexing
-  multiple operations onto a pre-allocated number of fully pipelined operator
-  instances.
+  multiple operations onto a pre-allocated number of operator instances. A
+  resource initiation interval controls how many cycles each request reserves
+  an instance and defaults to one for fully pipelined operators.
 - [ModuloProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ModuloProblem.html):
   Models an HLS classic: Pipeline scheduling with limited resources.
 - [ChainingProblem](https://circt.llvm.org/doxygen/classcirct_1_1scheduling_1_1ChainingProblem.html):
@@ -305,6 +306,13 @@ chaining-enabled modulo scheduling problem.
 - Integer linear programming-based scheduler
   ([`LPSchedulers.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/LPSchedulers.cpp)):
   Demo implementation for using an ILP solver via the OR-Tools integration.
+- Constraint programming scheduler
+  ([`CPSATSchedulers.cpp`](https://github.com/llvm/circt/blob/main/lib/Scheduling/CPSATSchedulers.cpp)):
+  Uses OR-Tools CP-SAT to solve `SharedOperatorsProblem` and `ModuloProblem`.
+  The modulo variant minimizes II before latency and supports periodic
+  multi-cycle resource reservations. Its one-hot and cumulative encodings are
+  exact alternatives; `auto` selects the cumulative encoding for large phase
+  expansions.
 
 ## Utilities
 

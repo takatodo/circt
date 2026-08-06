@@ -137,9 +137,9 @@ LogicalResult Problem::verifyPrecedence(Dependence dep) {
   // check if i's result is available before j starts
   if (!(stI + latI <= stJ))
     return getContainingOp()->emitError()
-           << "Precedence violated for dependence."
-           << "\n  from: " << *i << ", result available in t=" << (stI + latI)
-           << "\n  to:   " << *j << ", starts in t=" << stJ;
+           << "Precedence violated for dependence." << "\n  from: " << *i
+           << ", result available in t=" << (stI + latI) << "\n  to:   " << *j
+           << ", starts in t=" << stJ;
 
   return success();
 }
@@ -196,10 +196,9 @@ LogicalResult CyclicProblem::verifyPrecedence(Dependence dep) {
   // check if i's result is available before j starts (dist iterations later)
   if (!(stI + latI <= stJ + dist * ii))
     return getContainingOp()->emitError()
-           << "Precedence violated for dependence."
-           << "\n  from: " << *i << ", result available in t=" << (stI + latI)
-           << "\n  to:   " << *j << ", starts in t=" << stJ
-           << "\n  dist: " << dist << ", II=" << ii;
+           << "Precedence violated for dependence." << "\n  from: " << *i
+           << ", result available in t=" << (stI + latI) << "\n  to:   " << *j
+           << ", starts in t=" << stJ << "\n  dist: " << dist << ", II=" << ii;
 
   return success();
 }
@@ -295,9 +294,10 @@ LogicalResult ChainingProblem::verifyPrecedenceInCycle(Dependence dep) {
 
   if (!(sticI + oDelI <= sticJ))
     return getContainingOp()->emitError()
-           << "Precedence violated in cycle " << stJ << " for dependence:"
-           << "\n  from: " << *i << ", result after z=" << (sticI + oDelI)
-           << "\n  to:   " << *j << ", starts in z=" << sticJ;
+           << "Precedence violated in cycle " << stJ
+           << " for dependence:" << "\n  from: " << *i
+           << ", result after z=" << (sticI + oDelI) << "\n  to:   " << *j
+           << ", starts in z=" << sticJ;
 
   return success();
 }
@@ -338,7 +338,22 @@ SharedOperatorsProblem::getProperties(ResourceType rsrc) {
   auto psv = Problem::getProperties(rsrc);
   if (auto limit = getLimit(rsrc))
     psv.emplace_back("limit", std::to_string(*limit));
+  if (auto ii = getResourceInitiationInterval(rsrc))
+    psv.emplace_back("ii", std::to_string(*ii));
   return psv;
+}
+
+LogicalResult SharedOperatorsProblem::check() {
+  if (failed(Problem::check()))
+    return failure();
+
+  for (auto rsrc : getResourceTypes()) {
+    if (auto ii = getResourceInitiationInterval(rsrc); ii && *ii == 0)
+      return getContainingOp()->emitError()
+             << "Resource type '" << rsrc.getValue()
+             << "' has an invalid zero initiation interval";
+  }
+  return success();
 }
 
 LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
@@ -366,7 +381,7 @@ LogicalResult SharedOperatorsProblem::checkLatency(Operation *op) {
 
 LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
   auto limit = getLimit(rsrc);
-  if (!limit)
+  if (!limit || *limit == 0)
     return success();
 
   llvm::SmallDenseMap<unsigned, unsigned> nOpsPerTimeStep;
@@ -380,7 +395,10 @@ LogicalResult SharedOperatorsProblem::verifyUtilization(ResourceType rsrc) {
         }))
       continue;
 
-    ++nOpsPerTimeStep[*getStartTime(op)];
+    unsigned ii = getResourceInitiationInterval(rsrc).value_or(1);
+    for (unsigned time = *getStartTime(op), end = time + ii; time != end;
+         ++time)
+      ++nOpsPerTimeStep[time];
   }
 
   for (auto &kv : nOpsPerTimeStep)
@@ -408,9 +426,15 @@ LogicalResult SharedOperatorsProblem::verify() {
 // ModuloProblem
 //===----------------------------------------------------------------------===//
 
+LogicalResult ModuloProblem::check() {
+  return failed(Problem::check()) || failed(SharedOperatorsProblem::check())
+             ? failure()
+             : success();
+}
+
 LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
   auto limit = getLimit(rsrc);
-  if (!limit)
+  if (!limit || *limit == 0)
     return success();
 
   unsigned ii = *getInitiationInterval();
@@ -425,7 +449,9 @@ LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
         }))
       continue;
 
-    ++nOpsPerCongruenceClass[*getStartTime(op) % ii];
+    unsigned resourceII = getResourceInitiationInterval(rsrc).value_or(1);
+    for (unsigned offset = 0; offset != resourceII; ++offset)
+      ++nOpsPerCongruenceClass[(*getStartTime(op) + offset) % ii];
   }
 
   for (auto &kv : nOpsPerCongruenceClass)
@@ -433,7 +459,7 @@ LogicalResult ModuloProblem::verifyUtilization(ResourceType rsrc) {
       return getContainingOp()->emitError()
              << "Resource type '" << rsrc.getValue() << "' is oversubscribed."
              << "\n  congruence class: " << kv.first
-             << "\n  #operations: " << kv.second << "\n  limit: " << *limit;
+             << "\n  #reservations: " << kv.second << "\n  limit: " << *limit;
 
   return success();
 }

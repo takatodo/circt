@@ -22,6 +22,8 @@
 
 #include "llvm/ADT/StringExtras.h"
 
+#include <cmath>
+
 namespace circt {
 namespace ssp {
 #define GEN_PASS_DEF_SCHEDULE
@@ -42,6 +44,7 @@ using namespace ssp;
 static OperationOp getLastOp(InstanceOp instOp, StringRef options) {
   StringRef lastOpName = "";
   for (StringRef option : llvm::split(options, ',')) {
+    option = option.trim();
     if (option.consume_front("last-op-name=")) {
       lastOpName = option;
       break;
@@ -57,10 +60,138 @@ static OperationOp getLastOp(InstanceOp instOp, StringRef options) {
 // Determine desired cycle time (only relevant for `ChainingProblem` instances).
 static std::optional<float> getCycleTime(StringRef options) {
   for (StringRef option : llvm::split(options, ',')) {
+    option = option.trim();
     if (option.consume_front("cycle-time="))
       return std::stof(option.str());
   }
   return std::nullopt;
+}
+
+struct CPSATPassOptions {
+  CPSATSchedulerOptions scheduler;
+  bool reportStatistics = false;
+};
+
+static FailureOr<CPSATPassOptions> getCPSATOptions(InstanceOp instOp,
+                                                   StringRef options) {
+  CPSATPassOptions result;
+  for (StringRef option : llvm::split(options, ',')) {
+    option = option.trim();
+    if (option.empty() || option.consume_front("last-op-name="))
+      continue;
+    if (option.consume_front("time-limit=")) {
+      if (option.getAsDouble(result.scheduler.timeLimitSeconds) ||
+          !std::isfinite(result.scheduler.timeLimitSeconds) ||
+          result.scheduler.timeLimitSeconds <= 0.0) {
+        instOp.emitError("invalid cpsat 'time-limit' option; expected a "
+                         "finite positive number");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("workers=")) {
+      if (option.getAsInteger(10, result.scheduler.numWorkers) ||
+          result.scheduler.numWorkers == 0) {
+        instOp.emitError(
+            "invalid cpsat 'workers' option; expected a positive integer");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("minimize-latency=")) {
+      if (option == "true")
+        result.scheduler.minimizeLatency = true;
+      else if (option == "false")
+        result.scheduler.minimizeLatency = false;
+      else {
+        instOp.emitError("invalid cpsat 'minimize-latency' option; expected "
+                         "true or false");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("balanced-probe=")) {
+      if (option == "true")
+        result.scheduler.enableBalancedProbe = true;
+      else if (option == "false")
+        result.scheduler.enableBalancedProbe = false;
+      else {
+        instOp.emitError("invalid cpsat 'balanced-probe' option; expected "
+                         "true or false");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("balanced-probe-time-limit=")) {
+      if (option.getAsDouble(result.scheduler.balancedProbeTimeLimitSeconds) ||
+          !std::isfinite(result.scheduler.balancedProbeTimeLimitSeconds) ||
+          result.scheduler.balancedProbeTimeLimitSeconds <= 0.0) {
+        instOp.emitError(
+            "invalid cpsat 'balanced-probe-time-limit' option; expected a "
+            "finite positive number");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("resource-model=")) {
+      if (option == "auto")
+        result.scheduler.moduloResourceModel =
+            CPSATModuloResourceModel::autoSelect;
+      else if (option == "onehot")
+        result.scheduler.moduloResourceModel = CPSATModuloResourceModel::oneHot;
+      else if (option == "cumulative")
+        result.scheduler.moduloResourceModel =
+            CPSATModuloResourceModel::cumulative;
+      else {
+        instOp.emitError("invalid cpsat 'resource-model' option; expected "
+                         "auto, onehot, or cumulative");
+        return failure();
+      }
+      continue;
+    }
+    if (option.consume_front("report-statistics=")) {
+      if (option == "true")
+        result.reportStatistics = true;
+      else if (option == "false")
+        result.reportStatistics = false;
+      else {
+        instOp.emitError("invalid cpsat 'report-statistics' option; expected "
+                         "true or false");
+        return failure();
+      }
+      continue;
+    }
+    instOp.emitError() << "unknown cpsat scheduler option '" << option << "'";
+    return failure();
+  }
+  return result;
+}
+
+static StringRef getCPSATStatusName(CPSATSolveStatus status) {
+  switch (status) {
+  case CPSATSolveStatus::optimal:
+    return "optimal";
+  case CPSATSolveStatus::feasible:
+    return "feasible";
+  case CPSATSolveStatus::infeasible:
+    return "infeasible";
+  case CPSATSolveStatus::unknown:
+    return "unknown";
+  }
+  llvm_unreachable("unknown CP-SAT solve status");
+}
+
+static StringRef
+getCPSATResourceModelName(CPSATModuloResourceModel resourceModel) {
+  switch (resourceModel) {
+  case CPSATModuloResourceModel::autoSelect:
+    return "auto";
+  case CPSATModuloResourceModel::oneHot:
+    return "onehot";
+  case CPSATModuloResourceModel::cumulative:
+    return "cumulative";
+  }
+  llvm_unreachable("unknown CP-SAT resource model");
 }
 
 //===----------------------------------------------------------------------===//
@@ -218,18 +349,51 @@ static InstanceOp scheduleWithCPSAT(InstanceOp instOp, StringRef options,
     return {};
   }
 
-  auto problemName = instOp.getProblemName();
-  if (problemName != "SharedOperatorsProblem") {
-    llvm::errs() << "ssp-schedule: Unsupported problem '" << problemName
-                 << "' for CPSAT scheduler\n";
+  auto parsedOptions = getCPSATOptions(instOp, options);
+  if (failed(parsedOptions))
     return {};
+
+  CPSATSchedulerResult result;
+
+  auto problemName = instOp.getProblemName();
+  if (problemName == "SharedOperatorsProblem") {
+    auto prob = loadProblem<SharedOperatorsProblem>(instOp);
+    if (failed(prob.check()) ||
+        failed(scheduling::scheduleCPSAT(prob, lastOp, parsedOptions->scheduler,
+                                         &result)) ||
+        failed(prob.verify()))
+      return {};
+    if (parsedOptions->reportStatistics)
+      llvm::errs() << "cpsat: status=" << getCPSATStatusName(result.status)
+                   << "\n";
+    return saveProblem(prob, builder);
+  }
+  if (problemName == "ModuloProblem") {
+    auto prob = loadProblem<ModuloProblem>(instOp);
+    if (failed(prob.check()) ||
+        failed(scheduling::scheduleCPSAT(prob, lastOp, parsedOptions->scheduler,
+                                         &result)) ||
+        failed(prob.verify()))
+      return {};
+    if (parsedOptions->reportStatistics)
+      llvm::errs() << "cpsat: status=" << getCPSATStatusName(result.status)
+                   << ", lower-bound=" << result.lowerBound
+                   << ", II=" << result.initiationInterval
+                   << ", resource-model="
+                   << getCPSATResourceModelName(result.moduloResourceModel)
+                   << ", phase-indicators=" << result.phaseIndicatorCount
+                   << ", balanced-probe="
+                   << (!parsedOptions->scheduler.enableBalancedProbe ? "off"
+                       : result.balancedProbeSucceeded               ? "hit"
+                       : result.balancedProbeAttempted               ? "miss"
+                                                       : "skipped")
+                   << "\n";
+    return saveProblem(prob, builder);
   }
 
-  auto prob = loadProblem<SharedOperatorsProblem>(instOp);
-  if (failed(prob.check()) || failed(scheduling::scheduleCPSAT(prob, lastOp)) ||
-      failed(prob.verify()))
-    return {};
-  return saveProblem(prob, builder);
+  llvm::errs() << "ssp-schedule: Unsupported problem '" << problemName
+               << "' for CPSAT scheduler\n";
+  return {};
 }
 
 #endif // SCHEDULING_OR_TOOLS

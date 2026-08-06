@@ -145,4 +145,9 @@ def LimitProp : ResourceTypeProperty<SSPDialect,
   "Limit", "unsigned", "::circt::scheduling::SharedOperatorsProblem"> {
   let mnemonic = "limit";
 }
+def ResourceInitiationIntervalProp : ResourceTypeProperty<SSPDialect,
+  "ResourceInitiationInterval", "unsigned", "::circt::scheduling::SharedOperatorsProblem"> {
+  let mnemonic = "ii";
+}
+
 #endif // CIRCT_DIALECT_SSP_SSPATTRIBUTES_TD
